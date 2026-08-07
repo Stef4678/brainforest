@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Knowledge Brain</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+</head>
+<body>
+
+  <header id="toolbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <h1>Knowledge Brain</h1>
+    </div>
+
+    <div class="toolbar-actions">
+      <button id="btn-new-thought" class="btn primary" title="Create a new root thought" data-i18n="toolbar.newThought" data-i18n-title="toolbar.newThoughtTitle">＋ New thought</button>
+      <span id="link-hint" class="link-hint hidden"></span>
+      <button id="btn-link" class="btn" disabled title="Create parent → child link between two selected thoughts" data-i18n="toolbar.link" data-i18n-title="toolbar.linkTitle">Link parent→child</button>
+
+      <div class="seg-toggle" title="Switch between graph and outline view" data-i18n-title="toolbar.viewTitle">
+        <button id="btn-view-graph" class="seg active" data-i18n="toolbar.viewGraph">Graph</button>
+        <button id="btn-view-outline" class="seg" data-i18n="toolbar.viewOutline">Outline</button>
+      </div>
+
+      <button id="btn-connections" class="btn" title="Ask AI to find new links between your thoughts" data-i18n="toolbar.connections" data-i18n-title="toolbar.connectionsTitle">🔍 Find connections</button>
+      <button id="btn-translate-titles" class="btn" title="Translate all untranslated titles to Romanian" data-i18n="toolbar.translateTitles" data-i18n-title="toolbar.translateTitlesTitle">🌐 Translate titles</button>
+      <button id="btn-translate-content" class="btn" title="Translate all thought details to Romanian" data-i18n="toolbar.translateContent" data-i18n-title="toolbar.translateContentTitle">🌐 Translate content</button>
+
+      <label class="field-label">
+        <span data-i18n="toolbar.layout">Layout</span>
+        <select id="layout-select">
+          <option value="cose" selected data-i18n="toolbar.layoutOrganic">Organic</option>
+          <option value="breadthfirst" data-i18n="toolbar.layoutHierarchy">Hierarchy</option>
+          <option value="concentric" data-i18n="toolbar.layoutConcentric">Concentric</option>
+          <option value="mindmap" data-i18n="toolbar.layoutCascading">Cascading</option>
+        </select>
+      </label>
+
+      <div class="search-group">
+        <input id="search-input" type="search" placeholder="Search…" autocomplete="off" data-i18n-ph="toolbar.searchPh" />
+        <select id="search-mode" title="Search mode" data-i18n-title="toolbar.searchModeTitle">
+          <option value="exact" data-i18n="toolbar.searchExact">Exact</option>
+          <option value="ai" data-i18n="toolbar.searchAi">AI</option>
+        </select>
+        <div id="search-results" class="search-results hidden"></div>
+      </div>
+
+      <label class="field-label" title="Active knowledge base" data-i18n-title="toolbar.kbTitle">
+        <span data-i18n="toolbar.kb">KB</span>
+        <select id="kb-select"></select>
+      </label>
+      <button id="btn-kb-new" class="btn" title="Create a new knowledge base" data-i18n="toolbar.kbNew" data-i18n-title="toolbar.kbNewTitle">＋ New</button>
+      <button id="btn-kb-rename" class="btn" title="Rename the current knowledge base" data-i18n="toolbar.kbRename" data-i18n-title="toolbar.kbRenameTitle">Rename</button>
+      <button id="btn-kb-delete" class="btn danger" title="Delete a knowledge base" data-i18n="toolbar.kbDelete" data-i18n-title="toolbar.kbDeleteTitle">Delete</button>
+
+      <button id="btn-export" class="btn" title="Download knowledge base as JSON" data-i18n="toolbar.export" data-i18n-title="toolbar.exportTitle">Export</button>
+      <button id="btn-import" class="btn" title="Load a knowledge base from JSON" data-i18n="toolbar.import" data-i18n-title="toolbar.importTitle">Import</button>
+      <button id="btn-stats" class="btn" title="Knowledge base statistics" data-i18n="toolbar.stats" data-i18n-title="toolbar.statsTitle">📊 Stats</button>
+      <input id="import-file" type="file" accept=".json,application/json" hidden />
+      <button id="btn-settings" class="btn" title="DeepSeek settings" data-i18n="toolbar.settings" data-i18n-title="toolbar.settingsTitle">Settings</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- Chat panel -->
+    <section id="chat-panel">
+      <div class="panel-head">
+        <h2 data-i18n="chat.title">DeepSeek Chat</h2>
+        <span id="chat-status" class="status-dot" title="connection" data-i18n-title="chat.statusTitle"></span>
+      </div>
+
+      <label class="context-toggle" title="Include the selected thought as context in your prompt" data-i18n-title="chat.contextTitle">
+        <input type="checkbox" id="ctx-enabled" />
+        <span id="ctx-label" data-i18n="chat.useContext">Use selected thought as context</span>
+      </label>
+
+      <div id="followups" class="followups hidden"></div>
+
+      <div id="chat-msgs-resize" class="resize-handle-h" title="Drag to resize the chat area"></div>
+      <div id="chat-messages" class="chat-messages"></div>
+
+      <div id="save-row" class="save-row hidden">
+        <span class="save-row-label" data-i18n="chat.saveResponse">Save response</span>
+        <select id="save-target">
+          <option value="child" data-i18n="chat.saveChild">as child of selection</option>
+          <option value="sibling" data-i18n="chat.saveSibling">as sibling of selection</option>
+          <option value="root" data-i18n="chat.saveRoot">as a new root</option>
+        </select>
+        <button id="btn-save-response" class="btn primary" data-i18n="chat.saveAsThought">Save as thought</button>
+      </div>
+      <div id="suggestion-bar" class="suggestion-bar hidden">
+        <span id="suggestion-text"></span>
+        <button id="btn-save-suggestion" class="btn primary" data-i18n="chat.save">Save</button>
+      </div>
+
+      <div class="chat-input">
+        <textarea id="prompt-input" rows="3" placeholder="Ask DeepSeek… (Enter to send, Shift+Enter for newline)" data-i18n-ph="chat.promptPh"></textarea>
+        <button id="btn-send" class="btn primary" data-i18n="chat.send">Send</button>
+      </div>
+      <div class="chat-actions">
+        <button id="btn-save-prompt" class="btn subtle hidden" title="Save your prompt as a thought" data-i18n="chat.savePrompt" data-i18n-title="chat.savePromptTitle">Save prompt as thought</button>
+        <button id="btn-export-chat" class="btn subtle" title="Export the chat as a Markdown file" data-i18n="chat.exportMd" data-i18n-title="chat.exportMdTitle">Export chat as .md</button>
+      </div>
+    </section>
+
+    <div id="chat-resize" class="resize-handle" data-side="left" title="Drag to resize"></div>
+
+    <!-- Graph -->
+    <section id="graph-container">
+      <div id="graph"></div>
+      <div id="node-preview" class="node-preview hidden"></div>
+      <div id="outline" class="outline hidden"></div>
+      <div id="empty-hint" class="empty-hint hidden">
+        <p data-i18n="graph.empty">Your knowledge graph is empty.</p>
+        <button id="btn-empty-new" class="btn primary" data-i18n="graph.firstThought">Create your first thought</button>
+      </div>
+    </section>
+
+    <div id="detail-resize" class="resize-handle" data-side="right" title="Drag to resize"></div>
+
+    <!-- Detail panel -->
+    <section id="detail-panel">
+      <div id="detail-empty" class="detail-empty">
+        <p data-i18n="detail.empty">Select a thought to view and edit it.<br />Ctrl-click a second thought to create a parent → child link.</p>
+      </div>
+      <div id="detail-body" class="hidden">
+        <div class="panel-head">
+          <div class="title-row">
+            <h2 id="detail-title"></h2>
+            <button id="btn-copy-title" class="copy-btn" title="Copy thought name" data-i18n-title="detail.copyTitle" aria-label="Copy thought name">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="13" x="9" y="9" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <span id="detail-id" class="muted"></span>
+        </div>
+        <div class="detail-badges">
+          <span id="detail-source" class="source-badge hidden"></span>
+          <span id="detail-qtype" class="source-badge hidden"></span>
+        </div>
+        <div class="detail-actions">
+          <button id="btn-add-child" class="btn" data-i18n="detail.addChild">＋ Add child</button>
+          <button id="btn-add-sibling" class="btn" data-i18n="detail.addSibling">＋ Add sibling</button>
+          <button id="btn-extract" class="btn" title="Use AI to extract ideas from this thought's content as child thoughts" data-i18n="detail.extract" data-i18n-title="detail.extractTitle">✨ Extract ideas</button>
+          <button id="btn-generate" class="btn" title="Generate related thoughts (children, siblings, or parents)" data-i18n="detail.generate" data-i18n-title="detail.generateTitle">✨ Generate related</button>
+          <button id="btn-improve-title" class="btn" title="Ask AI to suggest a cleaner title for this thought" data-i18n="detail.improveTitle" data-i18n-title="detail.improveTitleTitle">✨ Improve title</button>
+          <button id="btn-gen-content" class="btn" title="Generate content for this thought" data-i18n="detail.genContent" data-i18n-title="detail.genContentTitle">✨ Generate content</button>
+          <button id="btn-reanalyze" class="btn" title="Check whether this thought's children fit, and suggest new ones" data-i18n="detail.reanalyze" data-i18n-title="detail.reanalyzeTitle">🔗 Reanalyze children</button>
+          <button id="btn-edit-thought" class="btn" data-i18n="detail.edit">Edit</button>
+          <button id="btn-delete-thought" class="btn danger" data-i18n="detail.delete">Delete</button>
+        </div>
+        <div class="detail-meta muted" id="detail-meta"></div>
+        <div class="content-wrap">
+          <button id="btn-copy-content" class="copy-btn copy-btn-corner" title="Copy thought content" data-i18n-title="detail.copyContent" aria-label="Copy thought content">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="13" x="9" y="9" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+          <div id="detail-content" class="detail-content"></div>
+        </div>
+
+        <div class="detail-section">
+          <h3 data-i18n="detail.parents">Parents</h3>
+          <ul id="detail-parents" class="thought-list"></ul>
+        </div>
+        <div class="detail-section">
+          <h3 data-i18n="detail.children">Children</h3>
+          <ul id="detail-children" class="thought-list"></ul>
+        </div>
+        <div class="detail-section">
+          <h3 data-i18n="detail.siblings">Siblings</h3>
+          <ul id="detail-siblings" class="thought-list"></ul>
+        </div>
+        <div class="detail-section">
+          <h3 data-i18n="detail.backlinks">Backlinks</h3>
+          <p class="section-hint" data-i18n="detail.backlinksHint">Thoughts that mention this one in their content</p>
+          <ul id="detail-backlinks" class="thought-list"></ul>
+        </div>
+
+        <div class="detail-section">
+          <h3 data-i18n="detail.comments">Comments</h3>
+          <div id="comments-list" class="comments-list"></div>
+          <div class="comment-form">
+            <input type="text" id="comment-input" placeholder="Add a comment…" data-i18n-ph="detail.commentPh" />
+            <button id="btn-comment-add" class="btn primary" data-i18n="detail.addComment">Add</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Modal -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div id="modal" class="modal">
+      <div class="modal-head">
+        <h2 id="modal-title">New thought</h2>
+        <button id="modal-close" class="modal-close">×</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
