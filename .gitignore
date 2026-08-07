@@ -216,3 +216,57 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Secrets — copy .env.example to .env and fill in your key
+.env
+
+# App data (SQLite KBs + registry are created on first run)
+*.db
+knowledge_bases/*.db
+knowledge_bases.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Backup files
+*.bak
+*.backup
+
+# Logs
+*.log
+logs/
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Python package manager files (if you ever use them)
+*.egg-info/
+dist/
+build/
+
+# Jupyter notebooks (if you use for testing)
+*.ipynb_checkpoints/
+
+# Local development server files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Database backups
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS-specific
+desktop.ini
