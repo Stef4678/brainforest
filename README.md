@@ -7,7 +7,7 @@
 
 ## 🧠 Project Pitch
 
-**Knowledge Brain** is a self-hosted, interactive knowledge graph application that visualizes your thoughts as a DAG (Directed Acyclic Graph). It combines structured knowledge representation with an integrated AI chat (DeepSeek V4 Flash), letting you build, explore, and query a personal "second brain."
+**Knowledge Brain** is a self-hosted, interactive knowledge management application that visualizes your thoughts as a tree (each thought has one parent, enforced with cycle detection). It combines structured knowledge representation with an integrated AI chat (DeepSeek V4 Flash), letting you build, explore, and query a personal "second brain."
 
 Think of it as a visual, AI-powered notebook where every idea can connect to any other idea — and where AI helps you expand your thinking.
 
