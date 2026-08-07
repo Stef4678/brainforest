@@ -17,7 +17,7 @@ Think of it as a visual, AI-powered notebook where every idea can connect to any
 
 This project demonstrates my ability to tackle full-stack challenges with clean architecture and thoughtful engineering:
 
-- **Complex Data Modeling** — Implemented and visualized a Directed Acyclic Graph (DAG) for thought relationships, handling multi-parent nodes, sibling relationships, and cycle detection.
+- **Complex Data Modeling** — Implemented and visualized a tree structure for thought relationships, handling parent-child links, sibling relationships, and cycle detection.
 - **Real-time Interaction** — Built an interactive, zoomable graph UI with vanilla JavaScript, supporting node selection, pan/zoom, and drag-based exploration.
 - **AI Integration** — Engineered streaming AI chat (Server-Sent Events) with context attachment, enabling AI-assisted knowledge expansion and one-click saving of responses as new graph nodes.
 - **Full-Stack Craft** — Designed a complete web application with FastAPI for high-performance async endpoints, SQLite for persistent storage, and a modular vanilla JS frontend.
