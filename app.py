@@ -4,19 +4,29 @@ Run with:  python app.py
 Then open: http://localhost:8000
 """
 
+import asyncio
 import json
+import logging
+import mimetypes
 import os
+import re
+import sqlite3
+import time
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import backup
 import db
 import deepseek_client
+import embeddings
 import kb_registry
 
 # override=True so a key set in .env wins over a stale DEEPSEEK_API_KEY
@@ -38,7 +48,52 @@ async def _set_current_kb():
     db.init_db()
 
 
-app = FastAPI(title="Knowledge Brain", dependencies=[Depends(_set_current_kb)])
+@asynccontextmanager
+async def lifespan(_app):
+    # Prepare the current KB and remove media files orphaned by deletions that
+    # raced an in-use (streaming) file handle on Windows.
+    kb_registry.ensure_registry()
+    db.set_db_path(kb_registry.current_path())
+    db.init_db()
+    _cleanup_orphan_media()
+    # Fail loudly at startup on a corrupt DB rather than silently serving a
+    # broken graph.
+    db.check_integrity()
+    task = asyncio.create_task(_backup_loop())
+    asyncio.create_task(_rebuild_consumer())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+def _backup_interval_hours() -> int:
+    settings = resolve_settings()
+    try:
+        return max(1, int(settings.get("backup_interval_hours", "24") or 24))
+    except ValueError:
+        return 24
+
+
+async def _backup_loop():
+    """Snapshot all KBs on a timer while the app runs.
+
+    Runs the first pass shortly after startup (only creating a backup when the
+    newest one is stale) so restarts don't spam snapshots, then every
+    interval. Config is re-read each tick so setting changes take effect.
+    """
+    try:
+        hours = _backup_interval_hours()
+        await asyncio.to_thread(backup.backup_if_stale, hours)
+        while True:
+            await asyncio.sleep(hours * 3600)
+            hours = _backup_interval_hours()
+            await asyncio.to_thread(backup.backup_if_stale, hours)
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Knowledge Brain", dependencies=[Depends(_set_current_kb)], lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,6 +101,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_error_handler(_request: Request, exc: sqlite3.OperationalError):
+    # Most OperationalErrors on a local app mean the disk is full or the DB is
+    # locked. SQLite's transaction semantics already rolled the write back, so
+    # the only thing lost is this request — surface a clear message instead of
+    # a raw "database is locked / disk I/O error".
+    logging.error("SQLite error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "The database could not be written (possibly the disk is "
+                      "full or the database is busy). No data was lost — your "
+                      "latest change was not saved. Free some disk space and "
+                      "try again."
+        },
+    )
 
 
 # ------------------------------------------------------------------ models
@@ -65,6 +138,16 @@ def resolve_settings():
         stored["model"] = env["DEEPSEEK_MODEL"]
     if env.get("DEEPSEEK_BASE_URL"):
         stored["base_url"] = env["DEEPSEEK_BASE_URL"]
+    if env.get("BACKUP_DIR"):
+        stored["backup_dir"] = env["BACKUP_DIR"]
+    if env.get("BACKUP_INTERVAL_HOURS"):
+        stored["backup_interval_hours"] = env["BACKUP_INTERVAL_HOURS"]
+    if env.get("BACKUP_KEEP"):
+        stored["backup_keep"] = env["BACKUP_KEEP"]
+    if env.get("EMBEDDING_MODEL"):
+        stored["embedding_model"] = env["EMBEDDING_MODEL"]
+    if env.get("EMBEDDING_ENABLED"):
+        stored["embedding_enabled"] = env["EMBEDDING_ENABLED"]
     return stored
 
 
@@ -95,12 +178,477 @@ def _kb_text(t) -> str:
     return t.get("content") or ""
 
 
+def _kb_line(t) -> str:
+    """One compact line describing a thought for an LLM context dump."""
+    snippet = " ".join((_kb_text(t) or "").split())
+    return f"- id {t['id']}: {t['title']}" + (f" | {snippet[:150]}" if snippet else "")
+
+
+def _retrieve(query: str, limit: int = 20):
+    """Top thoughts relevant to a query (local BM25), with a bounded fallback."""
+    hits = db.fts_search(query, limit=limit)
+    if hits:
+        return hits
+    return db.list_thoughts()[:limit]
+
+
+# ------------------------------------------------------------ embeddings
+
+_build_state = {"running": False, "scope": None}
+_rebuild_queue = asyncio.Queue()
+
+
+def _request_rebuild(scope, model):
+    if not _build_state["running"]:
+        _rebuild_queue.put_nowait((scope, model))
+
+
+def _embed_text(t) -> str:
+    parts = [t.get("title") or "", t.get("title_ro") or "", t.get("content") or "", t.get("content_ro") or ""]
+    return "\n".join(p for p in parts if p)[:4000]
+
+
+def _rebuild_kb(path, model):
+    """Sync (threadpool) sweep: embed all active thoughts in a KB, upsert. Never raises."""
+    thoughts = db.list_thoughts_in(path)
+    if not thoughts:
+        return
+    vecs = embeddings.embed_texts([_embed_text(t) for t in thoughts], model=model)
+    if vecs is None:
+        return
+    db.save_embeddings_bulk([(t["id"], v) for t, v in zip(thoughts, vecs)], model=model, path=path)
+
+
+async def _rebuild_consumer():
+    while True:
+        scope, model = await _rebuild_queue.get()
+        _build_state.update(running=True, scope=scope)
+        try:
+            names = kb_registry.list_bases() if scope == "all" else [kb_registry.get_current()]
+            for name in names:
+                db.init_db(kb_registry.path_for(name))
+                await asyncio.to_thread(_rebuild_kb, kb_registry.path_for(name), model)
+        except Exception as exc:
+            logging.error("Embedding rebuild failed: %s", exc)
+        finally:
+            _build_state["running"] = False
+
+
+def _index_thought(thought):
+    """Best-effort write-path hook. Never raises; skips when semantic search is disabled."""
+    try:
+        settings = resolve_settings()
+        if not _setting_bool(settings.get("embedding_enabled", "false")):
+            return
+        model = settings.get("embedding_model")
+        vec = embeddings.embed_one(_embed_text(thought), model=model)
+        if vec is not None:
+            db.save_embedding(thought["id"], model, len(vec), vec)
+    except Exception as exc:
+        logging.warning("Indexing thought %s failed: %s", thought.get("id"), exc)
+
+
+# ------------------------------------------------------------------ media
+
+MEDIA_ROOT = BASE_DIR / "media"
+
+
+def _media_root() -> Path:
+    # One media folder per knowledge base, keyed by the KB's file stem.
+    slug = Path(kb_registry.current_path()).stem
+    root = MEDIA_ROOT / slug
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _media_file_path(media: dict) -> Path:
+    root = _media_root().resolve()
+    path = (root / media["stored_path"]).resolve()
+    if not str(path).startswith(str(root)):
+        raise HTTPException(status_code=400, detail="Invalid media path")
+    return path
+
+
+def _remove_file(path: Path, attempts: int = 5, delay: float = 0.4) -> bool:
+    """Delete a file, retrying briefly to survive transient Windows locks.
+
+    The server holds video files open while streaming them to the browser, so a
+    delete that races playback can hit a locked file. Returns True if the file
+    is gone (or never existed), False if it is still locked after the retries."""
+    for i in range(attempts):
+        try:
+            if path.is_file():
+                path.unlink()
+            return True
+        except OSError:
+            if i < attempts - 1:
+                time.sleep(delay)
+    return False
+
+
+def _cleanup_orphan_media():
+    """Delete media files on disk that no longer have a DB row.
+
+    A deletion that races an open streaming handle (video playing in the
+    browser) can leave the file behind; the DB row is authoritative, so any
+    file not referenced by it is safe to remove. Best-effort on startup."""
+    try:
+        root = _media_root()
+    except Exception:
+        return
+    if not root.is_dir():
+        return
+    stored = {m["stored_path"] for m in db.all_media()}
+    for path in root.rglob("*"):
+        if path.is_file():
+            rel = path.relative_to(root).as_posix()
+            if rel not in stored:
+                _remove_file(path)
+
+
+_SAFE_FOLDER_RE = re.compile(r"[^A-Za-z0-9 _-]")
+
+
+def _sanitize_folder(name) -> str:
+    name = (name or "").strip().replace("/", " ").replace("\\", " ")
+    name = _SAFE_FOLDER_RE.sub("", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-_")
+    return name if name and len(name) <= 40 else ""
+
+
+def _folder_fallback(mime: str) -> str:
+    if mime.startswith("image/"):
+        return "Photos"
+    if mime.startswith("video/"):
+        return "Videos"
+    if mime.startswith("audio/"):
+        return "Audio"
+    if mime == "application/pdf":
+        return "PDFs"
+    if mime.startswith("text/") or mime in (
+        "application/json",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ):
+        return "Documents"
+    return "Uncategorized"
+
+
+def _ext_for(filename: str) -> str:
+    ext = Path(filename or "").suffix.lower()
+    return ext if re.fullmatch(r"\.[a-z0-9]{1,8}", ext) else ""
+
+
+def _mime_type(content_type, filename: str) -> str:
+    if content_type:
+        ctype = content_type.split(";")[0].strip().lower()
+        if ctype.startswith(("image/", "video/", "audio/", "text/", "application/", "model/")):
+            return ctype
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+# Codecs browsers can actually decode in a <video> element. mp4v (MPEG-4 Part 2)
+# is the common offender that plays audio-only.
+_BROWSER_VIDEO_CODECS = {
+    "avc1", "avc3", "hvc1", "hev1",  # H.264 / H.265
+    "vp09", "av01",                  # VP9 / AV1
+    "dvh1", "dvhe",                  # Dolby Vision (HDR H.264/HEVC)
+}
+
+
+def _stsd_sample_formats(body: bytes) -> list[bytes]:
+    if len(body) < 16:
+        return []
+    try:
+        count = int.from_bytes(body[4:8], "big")
+    except (IndexError, ValueError):
+        return []
+    out = []
+    pos = 8
+    for _ in range(count):
+        if pos + 8 > len(body):
+            break
+        size = int.from_bytes(body[pos:pos + 4], "big")
+        if size < 8:
+            break
+        out.append(body[pos + 4:pos + 8])
+        pos += size
+    return out
+
+
+_AUDIO_FORMATS = {b"mp4a", b"ac-3", b"ec-3", b"Opus", b"twos", b"sowt", b"samr", b"sawb"}
+
+
+def _walk_video_codec(data: bytes, start: int, end: int) -> str:
+    """Walk a box region for the moov -> trak -> mdia -> minf -> stbl -> stsd
+    chain and return the first non-audio sample-entry format (avc1, mp4v, ...)."""
+    stack = [(start, end)]
+    while stack:
+        box_start, box_end = stack.pop()
+        off = box_start
+        while off + 8 <= box_end:
+            size = int.from_bytes(data[off:off + 4], "big")
+            typ = data[off + 4:off + 8]
+            if size == 1 and off + 16 <= box_end:
+                size = int.from_bytes(data[off + 8:off + 16], "big")
+            elif size == 0:
+                size = box_end - off
+            if size < 8:
+                break
+            if typ == b"stsd":
+                for fmt in _stsd_sample_formats(data[off + 8:off + size]):
+                    if fmt not in _AUDIO_FORMATS:
+                        return fmt.decode("latin1", "replace")
+            elif typ in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+                stack.append((off + 8, off + size))
+            off += size
+    return ""
+
+
+def _moov_range(data: bytes):
+    """Locate a plausible moov box within a byte chunk that may not start at a
+    box boundary (e.g. a slice of the file tail). Returns (start, end) or None."""
+    pos = 0
+    while True:
+        pos = data.find(b"moov", pos)
+        if pos < 0:
+            return None
+        if pos >= 4:
+            size = int.from_bytes(data[pos - 4:pos], "big")
+            if 8 <= size <= len(data) - (pos - 4):
+                return pos - 4, pos - 4 + size
+        pos += 1
+
+
+def _video_codec(path: Path) -> str:
+    """Best-effort video track codec detection for mp4/mov (reads up to 16 MB)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            head = f.read(16 * 1024 * 1024)
+        if len(head) >= 8 and head[4:8] == b"ftyp":
+            codec = _walk_video_codec(head, 0, len(head))
+            if codec:
+                return codec
+        # moov may live at the tail (non-faststart files): scan the last chunk.
+        if size > len(head):
+            with open(path, "rb") as f:
+                f.seek(size - len(head))
+                tail = f.read(len(head))
+            rng = _moov_range(tail)
+            if rng:
+                codec = _walk_video_codec(tail, rng[0], rng[1])
+                if codec:
+                    return codec
+        return ""
+    except OSError:
+        return ""
+
+
+async def _suggest_folders(files: list[dict], thought_title: str, thought_content: str):
+    """Best-effort: one category folder per file (aligned with `files`), or None."""
+    lines = [f"- {i}: {f['name']} ({f['mime']})" for i, f in enumerate(files)]
+    messages = [
+        {
+            "role": "system",
+            "content": _lang_instruction() + (
+                "You organize media files for a personal knowledge base. Given the "
+                "thought they belong to and a numbered list of filenames with their "
+                "MIME types, suggest ONE short category folder for each file. Use "
+                "simple singular category names like Photos, Screenshots, Diagrams, "
+                "Documents, PDFs, Videos, Lectures, Audio, Research, Receipts, "
+                "Artwork. Return JSON exactly of the form: "
+                '{"folders": {"<index>": "<folder name>"}} with a key for every '
+                "index listed. Folder names must be at most 3 words and contain "
+                "only letters, digits, spaces, dash or underscore - no slashes, "
+                "dots, or path characters."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Thought title: {thought_title or '(none)'}"
+                + (f"\nThought content:\n{thought_content[:400]}" if thought_content else "")
+                + "\n\nFiles:\n" + "\n".join(lines)
+            ),
+        },
+    ]
+    settings = resolve_settings()
+    try:
+        result = await deepseek_client.chat_json(
+            messages,
+            model=settings["model"],
+            temperature=0.3,
+            api_key=settings["api_key"],
+            base_url=settings["base_url"],
+        )
+    except Exception:
+        return None
+    raw = result.get("folders") if isinstance(result, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    out = []
+    for i in range(len(files)):
+        val = raw.get(str(i))
+        if not isinstance(val, str):
+            val = raw.get(i)
+        out.append(_sanitize_folder(val))
+    return out
+
+
+@app.post("/api/thoughts/{thought_id}/media")
+async def upload_media(thought_id: int, files: list[UploadFile] = File(...)):
+    thought = db.get_thought(thought_id)
+    if thought is None:
+        raise HTTPException(status_code=404, detail="Thought not found")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    pending = []
+    for f in files:
+        name = os.path.basename(f.filename or "file")
+        pending.append({"name": name, "mime": _mime_type(f.content_type, name)})
+
+    folders = await _suggest_folders(
+        pending, _display_title(thought), _kb_text(thought)
+    )
+
+    root = _media_root()
+    created = []
+    for i, f in enumerate(files):
+        info = pending[i]
+        stored_name = uuid.uuid4().hex + _ext_for(info["name"])
+        # PDFs are always filed under PDFs/ regardless of the AI's classification,
+        # so they land somewhere predictable.
+        folder = "PDFs" if info["mime"] == "application/pdf" else (
+            (folders[i] if folders and folders[i] else "") or _folder_fallback(info["mime"])
+        )
+        dest_dir = root / folder
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / stored_name
+        size = 0
+        try:
+            with open(dest, "wb") as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    size += len(chunk)
+            codec = _video_codec(dest) if info["mime"].startswith("video/") else ""
+            media = db.add_media(
+                thought_id, info["name"],
+                (folder + "/" + stored_name) if folder else stored_name,
+                info["mime"], size, folder, codec,
+            )
+        except Exception:
+            _remove_file(dest)
+            raise
+        created.append(media)
+    return {"media": created}
+
+
+@app.get("/api/thoughts/{thought_id}/media")
+def list_thought_media(thought_id: int):
+    if db.get_thought(thought_id) is None:
+        raise HTTPException(status_code=404, detail="Thought not found")
+    return db.list_media(thought_id)
+
+
+@app.get("/media/{media_id}")
+def serve_media(media_id: int, request: Request):
+    media = db.get_media(media_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail="Media not found")
+    path = _media_file_path(media)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Media file missing on disk")
+    size = path.stat().st_size
+    media_type = media["mime_type"] or "application/octet-stream"
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+        "Content-Type": media_type,
+    }
+    # Range requests (video seeking): return a 206 byte slice.
+    range_header = request.headers.get("range")
+    if range_header and size > 0:
+        match = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+        if match:
+            start_s, end_s = match.groups()
+            start = int(start_s) if start_s else 0
+            end = int(end_s) if end_s else size - 1
+            start = min(max(start, 0), size - 1)
+            end = min(max(end, start), size - 1)
+            length = end - start + 1
+
+            def iterfile():
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+
+            return StreamingResponse(
+                iterfile(),
+                status_code=206,
+                headers={
+                    **base_headers,
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                    "Content-Length": str(length),
+                },
+            )
+    return FileResponse(path, media_type=media_type, headers=base_headers)
+
+
+@app.delete("/api/media/{media_id}")
+def remove_media(media_id: int):
+    media = db.delete_media(media_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail="Media not found")
+    removed = _remove_file(_media_file_path(media))
+    if removed:
+        return {"ok": True}
+    return {
+        "ok": True,
+        "file_removed": False,
+        "warning": "Removed from the knowledge base, but the file is still in use and could not be deleted from disk. It will be cleaned up automatically when the app restarts.",
+    }
+
+
+def _mirror_title_case(old_title: str, new_title: str, ro_title: str) -> str:
+    """Mirror a case-only rename of the English title onto the Romanian title.
+
+    When the English title changes purely in casing (e.g. "health" -> "Health"),
+    apply the same casing to the existing Romanian variant so the pair stays in
+    sync ("sănătate" -> "Sănătate") without re-translating. Returns the input
+    unchanged when the rename isn't case-only or there's no Romanian title."""
+    if not ro_title or new_title.lower() != old_title.lower():
+        return ro_title
+    ro = ro_title
+    old_first, new_first = old_title[:1], new_title[:1]
+    if old_first.islower() and new_first.isupper():
+        ro = ro[:1].upper() + ro[1:]
+    elif old_first.isupper() and new_first.islower():
+        ro = ro[:1].lower() + ro[1:]
+    if old_title != old_title.lower() and new_title == new_title.lower():
+        ro = ro.lower()
+    elif old_title != old_title.upper() and new_title == new_title.upper():
+        ro = ro.upper()
+    return ro
+
+
 async def _ensure_bilingual(title: str, content: str):
-    """Return (title, content, title_ro, content_ro) with ENGLISH always primary.
+    """Return (title, content, title_ro, content_ro, ok) with ENGLISH always primary.
 
     Detects whether the input is English or Romanian and fills in the other
     language, so `title`/`content` are always English and `title_ro`/`content_ro`
-    always Romanian. Falls back to (title, content, "", "") on any failure."""
+    always Romanian. On any failure it falls back to (title, content, "", "")
+    with ok=False, so callers can warn that no translation was stored."""
     settings = resolve_settings()
     messages = [
         {
@@ -127,22 +675,24 @@ async def _ensure_bilingual(title: str, content: str):
             base_url=settings["base_url"],
         )
         if not isinstance(result, dict):
-            return title, content, "", ""
+            return title, content, "", "", False
         if result.get("language") == "ro":
             return (
                 (result.get("title_en") or "").strip() or title,
                 (result.get("content_en") or "").strip() or content,
                 (result.get("title_ro") or "").strip() or title,
                 (result.get("content_ro") or "").strip() or content,
+                True,
             )
         return (
             title,
             content,
             (result.get("title_ro") or "").strip(),
             (result.get("content_ro") or "").strip(),
+            True,
         )
     except Exception:
-        return title, content, "", ""
+        return title, content, "", "", False
 
 
 # ------------------------------------------------------------------ models
@@ -200,6 +750,8 @@ class GenerateRelatedIn(BaseModel):
 
 class SemanticSearchIn(BaseModel):
     query: str
+    scope: str = "current"
+    mode: str = "rerank"  # "rerank" = existing LLM behavior; "vector" = pure local embeddings
 
 
 class SettingsIn(BaseModel):
@@ -209,6 +761,12 @@ class SettingsIn(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     language: str | None = None
+    auto_followups: str | None = None
+    backup_dir: str | None = None
+    backup_interval_hours: str | None = None
+    backup_keep: str | None = None
+    embedding_model: str | None = None
+    embedding_enabled: str | None = None
 
 
 # ------------------------------------------------------------------ thoughts
@@ -234,19 +792,29 @@ async def create_thought(body: ThoughtIn):
     content = body.content
     title_ro = body.title_ro.strip()
     content_ro = body.content_ro.strip()
+    attempted_translation = False
+    translation_ok = True
     if (
         not body.skip_translate
         and not title_ro
         and _setting_bool(db.get_settings().get("auto_translate", "true"))
     ):
         # Always store English as primary, regardless of the current UI language.
-        title, content, title_ro, content_ro = await _ensure_bilingual(title, content)
+        attempted_translation = True
+        title, content, title_ro, content_ro, translation_ok = await _ensure_bilingual(title, content)
     try:
-        return db.create_thought(
+        thought = db.create_thought(
             title, content, body.parent_ids,
             title_ro=title_ro, content_ro=content_ro, source=body.source,
             question_type=body.question_type,
         )
+        # A requested auto-translate that failed leaves the thought English-only;
+        # flag it so the UI can tell the user the Romanian variant is missing.
+        if attempted_translation and not translation_ok:
+            thought["translation_failed"] = True
+        if thought:
+            await asyncio.to_thread(_index_thought, thought)  # blocking ONNX work off the event loop
+        return thought
     except db.DuplicateTitleError as exc:
         raise HTTPException(
             status_code=409,
@@ -259,14 +827,23 @@ async def create_thought(body: ThoughtIn):
 
 @app.put("/api/thoughts/{thought_id}")
 def update_thought(thought_id: int, body: ThoughtUpdate):
-    if db.get_thought(thought_id) is None:
+    thought = db.get_thought(thought_id)
+    if thought is None:
         raise HTTPException(status_code=404, detail="Thought not found")
+    # When renaming the English title without touching the Romanian one, keep a
+    # case-only rename ("health" -> "Health") mirrored onto title_ro so the pair
+    # stays in sync ("sănătate" -> "Sănătate").
+    title_ro = body.title_ro
+    if body.title is not None and title_ro is None:
+        title_ro = _mirror_title_case(
+            thought.get("title") or "", body.title, thought.get("title_ro") or ""
+        )
     try:
-        return db.update_thought(
+        updated = db.update_thought(
             thought_id,
             title=body.title,
             content=body.content,
-            title_ro=body.title_ro,
+            title_ro=title_ro,
             content_ro=body.content_ro,
         )
     except db.DuplicateTitleError as exc:
@@ -277,6 +854,9 @@ def update_thought(thought_id: int, body: ThoughtUpdate):
                 "existing_id": exc.existing_id,
             },
         )
+    if updated:
+        _index_thought(updated)
+    return updated
 
 
 @app.delete("/api/thoughts/{thought_id}")
@@ -289,8 +869,99 @@ def delete_thought(thought_id: int, cascade: bool = False):
             status_code=409,
             detail="This thought has children. Delete them first, or use ?cascade=true.",
         )
-    db.delete_thought(thought_id, cascade=cascade)
+    ids = db.delete_thought(thought_id, cascade=cascade)
+    db.log_event("delete", thought_id, detail=f"cascade={cascade} ids={ids}")
+    # Media files are intentionally kept on disk so a restore brings them back;
+    # they are only removed on an explicit purge.
+    return {"ok": True, "deleted": ids}
+
+
+# ------------------------------------------------------------------ recycle bin
+
+@app.get("/api/trash")
+def list_trash():
+    return {"items": db.list_deleted()}
+
+
+@app.post("/api/thoughts/{thought_id}/restore")
+def restore_thought(thought_id: int):
+    thought = db.restore_thought(thought_id)
+    if thought is None:
+        raise HTTPException(status_code=404, detail="Thought not found in trash")
+    db.log_event("restore", thought_id)
+    return thought
+
+
+@app.delete("/api/thoughts/{thought_id}/purge")
+def purge_thought(thought_id: int):
+    media_rows = db.list_media_for_thoughts([thought_id])
+    if not db.purge_thought(thought_id):
+        raise HTTPException(status_code=404, detail="Thought not found")
+    for m in media_rows:
+        _remove_file(_media_file_path(m))
+    db.log_event("purge", thought_id)
     return {"ok": True}
+
+
+@app.delete("/api/trash")
+def purge_trash():
+    ids = db.purge_trash()
+    media_rows = db.list_media_for_thoughts(ids)
+    for m in media_rows:
+        _remove_file(_media_file_path(m))
+    db.log_event("purge_trash", detail=f"ids={ids}")
+    return {"ok": True, "purged": ids}
+
+
+# ------------------------------------------------------------------ backups
+
+@app.get("/api/backups")
+def list_backups():
+    return {"items": backup.list_backups()}
+
+
+@app.post("/api/backups")
+def create_backup(scope: str = "current"):
+    if scope == "all":
+        created = backup.backup_all()
+    else:
+        name = kb_registry.get_current()
+        created = [backup.create_backup(name)]
+    for b in created:
+        db.log_event("backup", detail=f"name={b['name']} file={b['filename']}")
+    return {"items": created}
+
+
+class RestoreBackupIn(BaseModel):
+    name: str
+    filename: str
+
+
+@app.post("/api/backups/restore")
+def restore_backup(body: RestoreBackupIn):
+    try:
+        live_path = backup.restore_backup(body.name, body.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except sqlite3.DatabaseError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    # Re-sync the live DB's schema/FTS (a restored older backup may predate
+    # columns or triggers added since).
+    if body.name == kb_registry.get_current():
+        db.set_db_path(live_path)
+        db.init_db()
+    _request_rebuild("all", resolve_settings().get("embedding_model"))
+    db.log_event("restore_backup", detail=f"name={body.name} file={body.filename}")
+    return {"ok": True, "path": live_path}
+
+
+# ------------------------------------------------------------------ audit
+
+@app.get("/api/audit")
+def list_audit():
+    return {"items": db.list_audit()}
 
 
 # ------------------------------------------------------------------ links
@@ -312,7 +983,26 @@ def remove_link(link_id: int):
 # ------------------------------------------------------------------ graph
 
 @app.get("/api/graph")
-def graph():
+def graph(scope: str = "current"):
+    if scope == "all":
+        # Composite "<slug>#<id>" keys so ids that collide across databases
+        # stay distinguishable. Every node also carries its KB name and the
+        # original numeric id so the frontend can translate back.
+        nodes, edges = [], []
+        for name in kb_registry.list_bases():
+            g = db.get_graph_in(kb_registry.path_for(name))
+            slug = Path(kb_registry.path_for(name)).stem
+            for n in g["nodes"]:
+                n["orig_id"] = n["id"]
+                n["kb"] = name
+                n["id"] = f"{slug}#{n['orig_id']}"
+                nodes.append(n)
+            for e in g["edges"]:
+                e["id"] = f"e-{slug}#{e['id']}"
+                e["parent_id"] = f"{slug}#{e['parent_id']}"
+                e["child_id"] = f"{slug}#{e['child_id']}"
+                edges.append(e)
+        return {"nodes": nodes, "edges": edges}
     return db.get_graph()
 
 
@@ -385,11 +1075,8 @@ async def suggest_link(body: SuggestLinkIn):
     if not content:
         raise HTTPException(status_code=400, detail="No content to place in the knowledge base")
 
-    thoughts = db.list_thoughts()
-    kb_lines = []
-    for t in thoughts[:300]:
-        snippet = " ".join((_kb_text(t) or "").split())
-        kb_lines.append(f"- id {t['id']}: {t['title']}" + (f" | {snippet[:150]}" if snippet else ""))
+    thoughts = _retrieve(body.title + " " + content, limit=25)
+    kb_lines = [_kb_line(t) for t in thoughts]
 
     user_parts = [
         f"The new thought is:\nTitle: {body.title}\nContent:\n{content}",
@@ -398,9 +1085,9 @@ async def suggest_link(body: SuggestLinkIn):
         user_parts.append(f"It came from this chat prompt: {body.prompt}")
     user_parts.append(
         "Choose the best existing thought to be its parent, or null for a new root "
-        "thought if nothing fits."
+        "thought if nothing fits or the best fit is not listed."
     )
-    user_parts.append("Existing thoughts:\n" + ("\n".join(kb_lines) if kb_lines else "(none)"))
+    user_parts.append("Most relevant existing thoughts (subset):\n" + ("\n".join(kb_lines) if kb_lines else "(none)"))
 
     messages = [
         {
@@ -408,7 +1095,8 @@ async def suggest_link(body: SuggestLinkIn):
             "content": _lang_instruction() + (
                 "You are organizing a personal knowledge base where thoughts form a "
                 "tree: each thought has a parent (or is a root). Given a new thought "
-                "and a list of existing thoughts, decide where it best belongs. Return "
+                "and a list of the most relevant existing thoughts, decide where it "
+                "best belongs. Return "
                 "JSON exactly of the form: "
                 '{"parent_id": <an existing thought id or null>, "reason": "..."} '
                 "The reason is one or two sentences explaining the choice. If no "
@@ -450,24 +1138,19 @@ async def suggest_link(body: SuggestLinkIn):
     }
 
 
-@app.post("/api/chat/suggest-title")
-async def suggest_title_for_content(body: SuggestTitleIn):
-    title = body.title.strip()
-    content = body.content.strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="No content to title")
-
+async def _suggest_titles(title: str, content: str) -> dict:
+    """Ask the model for 3-5 cleaner titles for a thought's title + content."""
     messages = [
         {
             "role": "system",
             "content": _lang_instruction() + (
-                "You help title a new thought in a personal knowledge base. The "
-                "current title may contain conversational filler or clutter, while "
-                "the real subject is shorter and clearer. Suggest 3 to 5 cleaner, "
-                "more descriptive titles that capture the subject concisely. Return "
-                'JSON exactly of the form: {"suggestions": [{"title": "...", '
-                '"reason": "..."}]} The reason is a short one-line explanation of '
-                "the change."
+                "You help title a thought in a personal knowledge base. The "
+                "current title may contain conversational filler or clutter, "
+                "while the real subject is shorter and clearer. Suggest 3 to 5 "
+                "cleaner, more descriptive titles that capture the subject "
+                "concisely. Return JSON exactly of the form: "
+                '{"suggestions": [{"title": "...", "reason": "..."}]} The reason '
+                "is a short one-line explanation of the change."
             ),
         },
         {
@@ -505,24 +1188,31 @@ async def suggest_title_for_content(body: SuggestTitleIn):
     return {"suggestions": clean}
 
 
+@app.post("/api/chat/suggest-title")
+async def suggest_title_for_content(body: SuggestTitleIn):
+    title = body.title.strip()
+    content = body.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="No content to title")
+    return await _suggest_titles(title, content)
+
+
 @app.post("/api/connections")
 async def find_connections(body: ConnectionsIn):
-    graph = db.get_graph()
-    nodes, edges = graph["nodes"], graph["edges"]
-    if not nodes:
+    all_thoughts = db.list_thoughts()
+    if not all_thoughts:
         raise HTTPException(status_code=400, detail="No thoughts to connect")
 
-    thought_lines = []
-    for t in nodes[:300]:
-        snippet = " ".join((_kb_text(t) or "").split())
-        thought_lines.append(
-            f"- id {t['id']}: {t['title']}" + (f" | {snippet[:150]}" if snippet else "")
-        )
+    theme = " ".join(t["title"] for t in all_thoughts)
+    nodes = _retrieve(theme, limit=40)
+    node_ids = {t["id"] for t in nodes}
     link_lines = [
         f"- {e['parent_id']} -> {e['child_id']}"
-        for e in edges[:400]
+        for e in db.get_graph()["edges"]
+        if e["parent_id"] in node_ids and e["child_id"] in node_ids
     ]
     existing_desc = "\n".join(link_lines) if link_lines else "(none)"
+    thought_lines = [_kb_line(t) for t in nodes]
 
     max_n = body.max_suggestions or 8
     messages = [
@@ -530,11 +1220,11 @@ async def find_connections(body: ConnectionsIn):
             "role": "system",
             "content": _lang_instruction() + (
                 "You analyze a personal knowledge base to find new, meaningful "
-                "relationships between existing thoughts. A thought can have a "
-                "parent and children, forming a tree (a child belongs under one "
-                "parent). Suggest NEW parent -> child links that are not already "
-                f"in the graph and that make sense, up to {max_n} suggestions. "
-                "Return JSON exactly of the form: "
+                "relationships between the existing thoughts listed below. A "
+                "thought can have a parent and children, forming a tree (a child "
+                "belongs under one parent). Suggest NEW parent -> child links, "
+                "between the listed thoughts only, that are not already in the "
+                "graph and that make sense. Return JSON exactly of the form: "
                 '{"connections": [{"parent_id": <existing id>, "child_id": '
                 '<existing id>, "reason": "..."}]} The reason is 1-2 sentences '
                 "explaining why the child belongs under that parent."
@@ -545,6 +1235,7 @@ async def find_connections(body: ConnectionsIn):
             "content": (
                 "Thoughts:\n" + "\n".join(thought_lines)
                 + "\n\nExisting links:\n" + existing_desc
+                + f"\n\nSuggest up to {max_n} new parent -> child links."
             ),
         },
     ]
@@ -654,57 +1345,7 @@ async def suggest_title(thought_id: int):
     thought = db.get_thought(thought_id)
     if thought is None:
         raise HTTPException(status_code=404, detail="Thought not found")
-
-    messages = [
-        {
-            "role": "system",
-            "content": _lang_instruction() + (
-                "You help improve the title of a thought in a personal knowledge "
-                "base. The current title may contain conversational filler or "
-                "clutter (for example 'Here is a solid overview to help you frame "
-                "\"X\"'), while the real subject is shorter and clearer. Suggest 3 "
-                "to 5 cleaner, more descriptive titles that capture the subject "
-                "concisely. Return JSON exactly of the form: "
-                '{"suggestions": [{"title": "...", "reason": "..."}]} The reason '
-                "is a short one-line explanation of the change."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Current title: {_display_title(thought)}\n\n"
-                f"Content:\n{_kb_text(thought)}"
-            ),
-        },
-    ]
-
-    settings = resolve_settings()
-    try:
-        result = await deepseek_client.chat_json(
-            messages,
-            model=settings["model"],
-            temperature=0.4,
-            api_key=settings["api_key"],
-            base_url=settings["base_url"],
-        )
-    except deepseek_client.ApiKeyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except deepseek_client.DeepSeekError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-
-    raw = result.get("suggestions") if isinstance(result, dict) else None
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=502, detail="DeepSeek did not return a list of suggestions")
-
-    clean = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        title = (item.get("title") or "").strip()
-        reason = (item.get("reason") or "").strip()
-        if title:
-            clean.append({"title": title, "reason": reason})
-    return {"suggestions": clean}
+    return await _suggest_titles(_display_title(thought), _kb_text(thought))
 
 
 @app.post("/api/thoughts/{thought_id}/reanalyze")
@@ -717,16 +1358,12 @@ async def reanalyze_children(thought_id: int):
     child_ids = {c["id"] for c in children}
     all_thoughts = db.list_thoughts()
     others = [
-        t for t in all_thoughts
+        t for t in _retrieve(_display_title(thought) + " " + _kb_text(thought), limit=20)
         if t["id"] != thought_id and t["id"] not in child_ids
     ]
 
-    def line(t):
-        snippet = " ".join((_kb_text(t) or "").split())
-        return f"- id {t['id']}: {t['title']}" + (f" | {snippet[:150]}" if snippet else "")
-
-    children_lines = [line(c) for c in children]
-    others_lines = [line(t) for t in others]
+    children_lines = [_kb_line(c) for c in children]
+    others_lines = [_kb_line(t) for t in others]
 
     messages = [
         {
@@ -736,8 +1373,9 @@ async def reanalyze_children(thought_id: int):
                 "base. Determine two things. (1) Whether each current child truly "
                 "belongs under this parent; if a child fits better under another "
                 "existing thought, flag it as misplaced and name the better "
-                "parent. (2) Which other existing thoughts would fit well as new "
-                "children of this parent. Return JSON exactly of the form: "
+                "parent. (2) Which other thoughts from the provided list would "
+                "fit well as new children of this parent. Return JSON exactly of "
+                "the form: "
                 '{"misplaced": [{"child_id": <id>, "suggested_parent_id": <id>, '
                 '"reason": "..."}], "new_children": [{"child_id": <id>, "reason": '
                 '"..."}]} Each reason is one or two sentences. Only reference ids '
@@ -836,9 +1474,8 @@ async def generate_related(thought_id: int, body: GenerateRelatedIn):
 
     all_thoughts = db.list_thoughts()
     existing_titles = {t["title"].strip().lower() for t in all_thoughts}
-    existing_lines = "\n".join(
-        f"- {t['title']}" for t in all_thoughts[:200]
-    ) or "(none)"
+    related = _retrieve(_display_title(thought) + " " + _kb_text(thought), limit=50)
+    existing_lines = "\n".join(f"- {t['title']}" for t in related) or "(none)"
 
     if rtype == "children":
         task = (
@@ -1190,6 +1827,12 @@ def get_settings():
         "base_url": settings["base_url"],
         "api_key_set": bool(settings["api_key"]),
         "language": settings["language"],
+        "auto_followups": settings["auto_followups"],
+        "backup_dir": settings.get("backup_dir", ""),
+        "backup_interval_hours": settings.get("backup_interval_hours", "24"),
+        "backup_keep": settings.get("backup_keep", "14"),
+        "embedding_model": settings.get("embedding_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"),
+        "embedding_enabled": settings.get("embedding_enabled", "false"),
     }
 
 
@@ -1273,51 +1916,155 @@ def delete_kb(name: str):
 
 @app.post("/api/kbs/clear")
 def clear_kb():
+    media_rows = db.all_media()
     db.clear_base()
+    for m in media_rows:
+        _remove_file(_media_file_path(m))
     return _kb_list_payload()
 
 
 # ------------------------------------------------------------------ stats
 
 @app.get("/api/stats")
-def stats():
-    thoughts = db.list_thoughts()
-    by_source = {}
-    for t in thoughts:
-        src = t.get("source") or "unknown"
-        by_source[src] = by_source.get(src, 0) + 1
+def stats(scope: str = "current"):
     # Follow-up question types; thoughts without a known type go to "untyped".
     QUESTION_TYPES = ("scientific", "practical", "comparative", "historical", "causal", "critical")
-    by_question_type = {}
-    for t in thoughts:
-        qtype = (t.get("question_type") or "").strip().lower()
-        if qtype not in QUESTION_TYPES:
-            qtype = "untyped"
-        by_question_type[qtype] = by_question_type.get(qtype, 0) + 1
-    return {"total": len(thoughts), "by_source": by_source, "by_question_type": by_question_type}
+
+    def _tally(thoughts):
+        by_source = {}
+        by_question_type = {}
+        for t in thoughts:
+            src = t.get("source") or "unknown"
+            by_source[src] = by_source.get(src, 0) + 1
+            qtype = (t.get("question_type") or "").strip().lower()
+            if qtype not in QUESTION_TYPES:
+                qtype = "untyped"
+            by_question_type[qtype] = by_question_type.get(qtype, 0) + 1
+        return by_source, by_question_type
+
+    if scope == "all":
+        per_kb = []
+        total = 0
+        agg_source, agg_qtype = {}, {}
+        for name in kb_registry.list_bases():
+            by_source, by_qtype = _tally(db.list_thoughts_in(kb_registry.path_for(name)))
+            per_kb.append({"name": name, "total": sum(by_source.values())})
+            total += per_kb[-1]["total"]
+            for k, v in by_source.items():
+                agg_source[k] = agg_source.get(k, 0) + v
+            for k, v in by_qtype.items():
+                agg_qtype[k] = agg_qtype.get(k, 0) + v
+        return {
+            "scope": "all",
+            "per_kb": per_kb,
+            "total": total,
+            "by_source": agg_source,
+            "by_question_type": agg_qtype,
+        }
+
+    by_source, by_question_type = _tally(db.list_thoughts())
+    return {"total": sum(by_source.values()), "by_source": by_source, "by_question_type": by_question_type}
 
 
 # ------------------------------------------------------------------ search
 
 @app.get("/api/search")
-def search_exact(q: str = ""):
+def search_exact(q: str = "", scope: str = "current"):
     query = q.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Search query is required")
     # escape LIKE wildcards, keep the query literal
     escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = f"%{escaped}%"
-    conn = db._connect()
-    try:
-        rows = conn.execute(
-            "SELECT id, title, title_ro, content, content_ro FROM thoughts "
-            "WHERE title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' "
-            "ORDER BY title LIMIT 30",
-            (pattern, pattern),
-        ).fetchall()
-    finally:
-        conn.close()
-    return {"results": [dict(r) for r in rows]}
+    if scope == "all":
+        results = []
+        for name in kb_registry.list_bases():
+            for r in db.search_exact_in(kb_registry.path_for(name), pattern, limit=10):
+                r["kb"] = name
+                results.append(r)
+        return {"results": results[:40]}
+    return {"results": db.search_exact_in(kb_registry.current_path(), pattern, limit=30)}
+
+
+@app.post("/api/search/embeddings/rebuild")
+def rebuild_embeddings(scope: str = "current"):
+    if _build_state["running"]:
+        return {"started": False, "scope": _build_state["scope"]}
+    _request_rebuild(scope, resolve_settings().get("embedding_model"))
+    return {"started": True, "scope": scope}
+
+
+@app.get("/api/search/embeddings/status")
+def embeddings_status(scope: str = "current"):
+    settings = resolve_settings()
+    out = {
+        "enabled": _setting_bool(settings.get("embedding_enabled", "false")),
+        "model": settings.get("embedding_model"),
+        "building": _build_state["running"],
+    }
+    if scope == "all":
+        per = []
+        for name in kb_registry.list_bases():
+            db.init_db(kb_registry.path_for(name))
+            s = db.embedding_status_in(kb_registry.path_for(name))
+            s["name"] = name
+            per.append(s)
+        out["per_kb"] = per
+    else:
+        out["kb"] = kb_registry.get_current()
+        out.update(db.embedding_status_in(kb_registry.current_path()))
+        out["model"] = settings.get("embedding_model")
+    return out
+
+
+async def _semantic_vector_search(body: SemanticSearchIn, query: str):
+    """Pure local-embedding ranking — no LLM, no API key."""
+    settings = resolve_settings()
+    if not _setting_bool(settings.get("embedding_enabled", "false")):
+        raise HTTPException(
+            status_code=400,
+            detail="Semantic search is not enabled. Enable it in Settings.",
+        )
+    model = settings.get("embedding_model")
+    qvec = await asyncio.to_thread(embeddings.embed_one, query, model=model)
+    if qvec is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Embedding model unavailable. Check that fastembed is installed; the model downloads on first use.",
+        )
+
+    def _row(t):
+        txt = " ".join((_kb_text(t) or t.get("content") or "").split())
+        return {
+            "id": t["id"],
+            "title": t["title"],
+            "title_ro": t.get("title_ro", ""),
+            "snippet": txt[:220],
+            "score": round(t["score"], 4),
+        }
+
+    if body.scope == "all":
+        slug_by_name = {Path(kb_registry.path_for(name)).stem: name for name in kb_registry.list_bases()}
+        hits = []
+        for name in kb_registry.list_bases():
+            db.init_db(kb_registry.path_for(name))
+            slug = Path(kb_registry.path_for(name)).stem
+            for t in db.semantic_search_in(kb_registry.path_for(name), qvec, limit=8, model=model):
+                r = _row(t)
+                r["id"] = f"{slug}#{r['id']}"
+                hits.append(r)
+        hits.sort(key=lambda r: r["score"], reverse=True)
+        hits = hits[:20]
+        for r in hits:
+            slug, _, id_part = str(r["id"]).partition("#")
+            r["id"] = int(id_part)
+            r["kb"] = slug_by_name.get(slug, slug)
+        return {"results": hits}
+    return {
+        "results": [
+            _row(t) for t in db.semantic_search_in(kb_registry.current_path(), qvec, limit=20, model=model)
+        ]
+    }
 
 
 @app.post("/api/search/semantic")
@@ -1326,28 +2073,48 @@ async def search_semantic(body: SemanticSearchIn):
     if not query:
         raise HTTPException(status_code=400, detail="Search query is required")
 
-    thoughts = db.list_thoughts()
-    lines = []
-    for t in thoughts[:300]:
-        snippet = " ".join((_kb_text(t) or "").split())
-        lines.append(f"- id {t['id']}: {t['title']}" + (f" | {snippet[:150]}" if snippet else ""))
+    if body.mode == "vector":
+        return await _semantic_vector_search(body, query)
+
+    if body.scope == "all":
+        # Candidate thoughts from every KB, keyed by a composite "slug#id" so
+        # ids that collide across databases stay distinguishable.
+        slug_by_name = {Path(kb_registry.path_for(name)).stem: name for name in kb_registry.list_bases()}
+        candidates = {}
+        lines = []
+        for name in kb_registry.list_bases():
+            slug = Path(kb_registry.path_for(name)).stem
+            for t in db.fts_search_in(kb_registry.path_for(name), query, limit=8):
+                key = f"{slug}#{t['id']}"
+                candidates[key] = t
+                snippet = " ".join((_kb_text(t) or "").split())
+                lines.append(f"- id {key}: {t['title']}" + (f" | {snippet[:150]}" if snippet else ""))
+        id_prompt = (
+            ' The id is a composite key like "health#2" that identifies the '
+            "thought's knowledge base and id — use the exact composite key given."
+        )
+    else:
+        thoughts = _retrieve(query, limit=20)
+        candidates = {t["id"]: t for t in thoughts}
+        lines = [_kb_line(t) for t in thoughts]
+        id_prompt = ""
 
     messages = [
         {
             "role": "system",
             "content": _lang_instruction() + (
                 "You search a personal knowledge base. Given a user query and a "
-                "list of thoughts, return up to 8 thoughts most relevant to the "
-                "query, ranked best first. Include thoughts that match the query's "
-                "meaning or synonyms even if the exact words differ. Each match "
-                "has a one-line reason. If nothing is relevant, return an empty "
-                "list. Return JSON exactly of the form: "
+                "list of candidate thoughts, return up to 8 thoughts most "
+                "relevant to the query, ranked best first. Include thoughts that "
+                "match the query's meaning or synonyms even if the exact words "
+                "differ. Each match has a one-line reason. If nothing is "
+                "relevant, return an empty list. Return JSON exactly of the form: "
                 '{"matches": [{"id": <existing id>, "reason": "..."}]}'
-            ),
+            ) + id_prompt,
         },
         {
             "role": "user",
-            "content": f"Query: {query}\n\nThoughts:\n" + ("\n".join(lines) if lines else "(none)"),
+            "content": f"Query: {query}\n\nCandidate thoughts:\n" + ("\n".join(lines) if lines else "(none)"),
         },
     ]
 
@@ -1369,7 +2136,6 @@ async def search_semantic(body: SemanticSearchIn):
     if not isinstance(raw, list):
         raise HTTPException(status_code=502, detail="DeepSeek did not return a list of matches")
 
-    titles = {t["id"]: t for t in thoughts}
     seen = set()
     results = []
     for item in raw:
@@ -1377,15 +2143,21 @@ async def search_semantic(body: SemanticSearchIn):
             continue
         tid = item.get("id")
         reason = (item.get("reason") or "").strip()
-        if not isinstance(tid, int) or tid not in titles or tid in seen:
+        if tid not in candidates or tid in seen:
             continue
         seen.add(tid)
-        results.append({
+        t = candidates[tid]
+        row = {
             "id": tid,
-            "title": titles[tid]["title"],
-            "title_ro": titles[tid].get("title_ro", ""),
+            "title": t["title"],
+            "title_ro": t.get("title_ro", ""),
             "reason": reason,
-        })
+        }
+        if body.scope == "all":
+            slug, _, id_part = str(tid).partition("#")
+            row["id"] = int(id_part)
+            row["kb"] = slug_by_name.get(slug, slug)
+        results.append(row)
     return {"results": results}
 
 
@@ -1402,7 +2174,13 @@ def import_kb(graph_data: dict):
         raise HTTPException(
             status_code=400, detail="Expected JSON with 'nodes' and 'edges' arrays"
         )
-    return db.import_kb(graph_data)
+    # Import replaces the whole KB: drop the previous media rows' files too.
+    media_rows = db.all_media()
+    result = db.import_kb(graph_data)
+    for m in media_rows:
+        _remove_file(_media_file_path(m))
+    _request_rebuild("current", resolve_settings().get("embedding_model"))
+    return result
 
 
 # ------------------------------------------------------------------ static
