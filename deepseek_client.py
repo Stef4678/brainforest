@@ -28,7 +28,7 @@ def _chat_url(base_url: str) -> str:
     return base + "/v1/chat/completions"
 
 
-async def stream_chat(messages, *, model, temperature, thinking, api_key, base_url):
+async def stream_chat(messages, *, model, temperature, thinking, api_key, base_url, max_tokens=2048):
     if not api_key:
         raise ApiKeyError(
             "No DeepSeek API key configured. Set DEEPSEEK_API_KEY in the .env file "
@@ -41,6 +41,7 @@ async def stream_chat(messages, *, model, temperature, thinking, api_key, base_u
         "messages": messages,
         "temperature": float(temperature),
         "stream": True,
+        "max_tokens": max_tokens,
     }
     if thinking:
         payload["thinking"] = {"type": "enabled"}
@@ -85,7 +86,7 @@ async def stream_chat(messages, *, model, temperature, thinking, api_key, base_u
                     yield {"type": "delta", "content": content}
 
 
-async def chat_json(messages, *, model, temperature, api_key, base_url):
+async def chat_json(messages, *, model, temperature, api_key, base_url, max_tokens=1024):
     """Non-streaming completion that returns parsed JSON.
 
     Forced into json_object mode with thinking disabled so the model returns a
@@ -104,6 +105,11 @@ async def chat_json(messages, *, model, temperature, api_key, base_url):
         "temperature": float(temperature),
         "stream": False,
         "response_format": {"type": "json_object"},
+        "max_tokens": max_tokens,
+        # Thinking mode is off so the whole token budget goes to the JSON answer
+        # (reasoning tokens otherwise crowd out long translations and truncate
+        # the output mid-JSON).
+        "thinking": {"type": "disabled"},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
