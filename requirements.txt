@@ -9,6 +9,6 @@ python-dotenv==1.0.1
 httpx==0.28.1
 
 # Embedding/Vector Search
-fastembed>=0.4
+fastembed>=0.8
 
 # Note: SQLite is built into Python, so no package needed.
