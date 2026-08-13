@@ -1,4 +1,3 @@
-<img width="480" height="236" alt="Screen Recording 2026-08-13 223244_480w_30fps_4x" src="https://github.com/user-attachments/assets/1181c488-e568-4e73-b0e9-0519513eac3e" />
 # Brainforest
 
 > A personal knowledge base with an interactive knowledge graph (DAG of linked thoughts) + streaming AI chat — built with FastAPI, SQLite, and vanilla JS.
