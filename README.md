@@ -1,3 +1,4 @@
+<img width="480" height="236" alt="Screen Recording 2026-08-13 223244_480w_30fps_4x" src="https://github.com/user-attachments/assets/1181c488-e568-4e73-b0e9-0519513eac3e" />
 # Brainforest
 
 > A personal knowledge base with an interactive knowledge graph (DAG of linked thoughts) + streaming AI chat — built with FastAPI, SQLite, and vanilla JS.
@@ -51,7 +52,7 @@ This project demonstrates my ability to tackle full-stack challenges with clean 
 
 ## 🖼️ Screenshots
 
-<img width="700" alt="Screenshot 2026-08-13 223817" src="https://github.com/user-attachments/assets/c7b7d9a2-862b-4bbd-b504-b3f2b9a56498" />
+<img width="700" alt="Screen Recording 2026-08-13 223244_480w_30fps_4x" src="https://github.com/user-attachments/assets/293fdbf0-5f35-4af0-9043-eb0e9e7a2cf1" />
 <img width="700" alt="Screenshot 2026-08-13 223817" src="https://github.com/user-attachments/assets/2cace374-0ba2-4291-aedf-12d61b572005" />
 <img width="700" alt="Screenshot 2026-08-13 223839" src="https://github.com/user-attachments/assets/1fbe17cf-11fd-42ff-83c5-e1ca2f043d78" />
 <img width="700" alt="Screenshot 2026-08-13 223926" src="https://github.com/user-attachments/assets/749aebb2-a8ef-4fe0-a362-171e8c219d23" />
