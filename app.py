@@ -1366,6 +1366,56 @@ def _clean_new_concepts(raw, skip_lower=""):
     return out[:8]
 
 
+def _parse_suggest_link(result, thoughts, skip_lower=""):
+    """Validate and normalize a suggest-link model response.
+
+    Returns (suggestions, new_parents). Raises ValueError when the model did not
+    return a list of suggestions at all.
+    """
+    raw = result.get("suggestions") if isinstance(result, dict) else None
+    if not isinstance(raw, list):
+        raise ValueError("DeepSeek did not return a list of suggestions")
+    existing_ids = {t["id"] for t in thoughts}
+    titles = {t["id"]: t["title"] for t in thoughts}
+
+    items = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        pid = it.get("parent_id")
+        reason = (it.get("reason") or "").strip()
+        english = it.get("english")
+        english = (english.strip() if isinstance(english, str) else "") or None
+        if not isinstance(pid, int) or pid not in existing_ids:
+            continue
+        items.append({"parent_id": pid, "reason": reason, "english": english})
+
+    # Dedupe, keep order.
+    seen, deduped = set(), []
+    for it in items:
+        if it["parent_id"] not in seen:
+            seen.add(it["parent_id"])
+            deduped.append(it)
+
+    if raw and isinstance(raw[0], dict) and raw[0].get("parent_id") is None:
+        # Top choice is "new root" — return a single null suggestion so the
+        # chat save flow's root-vs-parent semantics stay intact.
+        suggestions = [{"parent_id": None, "parent_title": None, "reason": (raw[0].get("reason") or "").strip(), "english": None}]
+    else:
+        suggestions = [
+            {
+                "parent_id": it["parent_id"],
+                "parent_title": titles.get(it["parent_id"]),
+                "reason": it["reason"],
+                "english": it["english"],
+            }
+            for it in deduped[:3]
+        ]
+
+    new_parents = _clean_new_concepts(result.get("new_parents") if isinstance(result, dict) else None, skip_lower)
+    return suggestions, new_parents
+
+
 @app.post("/api/chat/suggest-link")
 async def suggest_link(body: SuggestLinkIn):
     content = body.content.strip()
@@ -1454,51 +1504,51 @@ async def suggest_link(body: SuggestLinkIn):
     except deepseek_client.DeepSeekError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    raw = result.get("suggestions") if isinstance(result, dict) else None
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=502, detail="DeepSeek did not return a list of suggestions")
-    existing_ids = {t["id"] for t in thoughts}
-    titles = {t["id"]: t["title"] for t in thoughts}
+    try:
+        suggestions, new_parents = _parse_suggest_link(result, thoughts, body.title.strip().lower())
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
-    items = []
-    for it in raw:
-        if not isinstance(it, dict):
-            continue
-        pid = it.get("parent_id")
-        reason = (it.get("reason") or "").strip()
-        english = it.get("english")
-        english = (english.strip() if isinstance(english, str) else "") or None
-        if not isinstance(pid, int) or pid not in existing_ids:
-            continue
-        items.append({"parent_id": pid, "reason": reason, "english": english})
-
-    # Dedupe, keep order.
-    seen, deduped = set(), []
-    for it in items:
-        if it["parent_id"] not in seen:
-            seen.add(it["parent_id"])
-            deduped.append(it)
-
-    if raw and isinstance(raw[0], dict) and raw[0].get("parent_id") is None:
-        # Top choice is "new root" — return a single null suggestion so the
-        # chat save flow's root-vs-parent semantics stay intact.
-        suggestions = [{"parent_id": None, "parent_title": None, "reason": (raw[0].get("reason") or "").strip(), "english": None}]
-    else:
-        suggestions = [
-            {
-                "parent_id": it["parent_id"],
-                "parent_title": titles.get(it["parent_id"]),
-                "reason": it["reason"],
-                "english": it["english"],
-            }
-            for it in deduped[:3]
-        ]
-
-    # New-parent proposals (taxonomic chain) used when no existing thought fits.
-    new_parents = _clean_new_concepts(
-        result.get("new_parents") if isinstance(result, dict) else None,
-        body.title.strip().lower(),
-    )
+    # No concrete result — common when the thought is already the broadest
+    # concept in the KB (a root orphan: every retrieved candidate is more
+    # specific). Ask the model once more to propose broader parent concepts
+    # instead of nothing. Treat a lone null suggestion the same as empty,
+    # since the frontend drops null suggestions. Scoped to the "suggest
+    # parents for an existing thought" flows (child_id set) — the chat-save
+    # flow relies on a null suggestion meaning "save as root" and must keep it.
+    has_concrete = any(s.get("parent_id") is not None for s in suggestions)
+    if body.child_id is not None and (not has_concrete) and not new_parents:
+        try:
+            result = await deepseek_client.chat_json(
+                messages
+                + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous answer offered no concrete parent and no "
+                            "new_parents. The thought above is likely the broadest existing concept in "
+                            "this knowledge base. Propose 1 to 3 NEW broader parent "
+                            "concepts it belongs under (for example, for 'Life': "
+                            "'Existence', 'Reality', 'Ontology', 'Universe'), broadest "
+                            "first, in the new_parents array — or, if one of the existing "
+                            "thoughts listed above is genuinely broader, return it in "
+                            "suggestions. Do NOT return empty suggestions AND empty "
+                            "new_parents."
+                        ),
+                    },
+                ],
+                model=settings["model"],
+                temperature=0.4,
+                api_key=settings["api_key"],
+                base_url=settings["base_url"],
+            )
+        except deepseek_client.DeepSeekError:
+            pass  # keep the original empty result rather than failing the request
+        else:
+            try:
+                suggestions, new_parents = _parse_suggest_link(result, thoughts, body.title.strip().lower())
+            except ValueError:
+                pass
 
     return {"suggestions": suggestions, "new_parents": new_parents}
 

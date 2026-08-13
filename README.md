@@ -49,11 +49,14 @@ This project demonstrates my ability to tackle full-stack challenges with clean 
 
 ---
 
-## 🖼️ Demo
+## 🖼️ Screenshots
 
-*(Add screenshots here once you create them)*
-
-> Example: Main graph view with nodes, edges, and detail panel.
+<img width="700" alt="Screenshot 2026-08-13 223817" src="https://github.com/user-attachments/assets/c7b7d9a2-862b-4bbd-b504-b3f2b9a56498" />
+<img width="700" alt="Screenshot 2026-08-13 223817" src="https://github.com/user-attachments/assets/2cace374-0ba2-4291-aedf-12d61b572005" />
+<img width="700" alt="Screenshot 2026-08-13 223839" src="https://github.com/user-attachments/assets/1fbe17cf-11fd-42ff-83c5-e1ca2f043d78" />
+<img width="700" alt="Screenshot 2026-08-13 223926" src="https://github.com/user-attachments/assets/749aebb2-a8ef-4fe0-a362-171e8c219d23" />
+<img width="700" alt="Screenshot 2026-08-13 223955" src="https://github.com/user-attachments/assets/722c788d-af3e-4659-8747-0755ab8d7b61" />
+<img width="700" alt="Screenshot 2026-08-13 224052" src="https://github.com/user-attachments/assets/45c60758-d66d-46f2-96d4-a5e11cf35115" />
 
 ---
 

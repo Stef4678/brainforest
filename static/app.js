@@ -230,7 +230,7 @@
       "review.aiLink": "Suggest parent",
       "review.linking": "Asking AI…",
       "review.accept": "Add link",
-      "review.noSuggestions": "No parent suggestions found.",
+      "review.noSuggestions": "No parent suggestions found — this thought may already be the root (nothing broader exists).",
       "review.newParentsIntro": "Proposed new parents by taxonomic rank:",
       "review.createChain": "Create & link",
       "rel.childrenSection": "Suggested children:",
@@ -670,7 +670,7 @@
       "review.aiLink": "Sugerează părinte",
       "review.linking": "Întreb AI-ul…",
       "review.accept": "Adaugă legătura",
-      "review.noSuggestions": "Nu s-au găsit sugestii de părinți.",
+      "review.noSuggestions": "Nu s-au găsit sugestii de părinți — acest gând este probabil deja rădăcina (nu există un concept mai larg).",
       "review.newParentsIntro": "Părinți noi propuși după rang taxonomic:",
       "review.createChain": "Creează și leagă",
       "rel.childrenSection": "Copii sugerați:",
@@ -1654,8 +1654,13 @@
       showNodeMenu(oe.clientX, oe.clientY, nodeMenuItems(t));
     });
 
-    // Suppress the browser's native context menu over the graph canvas.
-    graphEl.addEventListener("contextmenu", (e) => e.preventDefault());
+    // Suppress the browser's native context menu over the whole graph viewport
+    // (canvas + overlays like the minimap and hover card, which are siblings of
+    // #graph — a listener on the canvas alone would let the OS menu leak
+    // through on top of the custom thought menu).
+    $("graph-container").addEventListener("contextmenu", (e) => {
+      if (state.viewMode === "graph") e.preventDefault();
+    });
 
     menu.addEventListener("click", (e) => e.stopPropagation());
     document.addEventListener("click", hideNodeMenu);
@@ -2269,9 +2274,10 @@
       container.insertAdjacentHTML("beforeend", '<div class="outline-empty">' + tr("timeline.empty") + "</div>");
       return;
     }
+    const sortField = state.timelineSort === "created" ? "created_at" : "updated_at";
     const byDay = new Map();
     for (const t of visible) {
-      const key = timelineDayKey(state.timelineSort === "created" ? t.created_at : t.updated_at);
+      const key = timelineDayKey(t[sortField]);
       if (!byDay.has(key)) byDay.set(key, []);
       byDay.get(key).push(t);
     }
@@ -2283,7 +2289,9 @@
       head.className = "tl-date";
       head.textContent = timelineDayLabel(day);
       group.appendChild(head);
-      for (const t of byDay.get(day)) {
+      // Newest first within each day, matching the descending day order.
+      const rows = byDay.get(day).slice().sort((a, b) => (b[sortField] || "").localeCompare(a[sortField] || ""));
+      for (const t of rows) {
         const row = document.createElement("div");
         row.className = "tl-row";
         row.dataset.id = t.id;
