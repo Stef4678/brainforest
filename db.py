@@ -13,7 +13,7 @@ import contextvars
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LEGACY_DB_PATH = os.path.join(BASE_DIR, "knowledge_brain.db")
+LEGACY_DB_PATH = os.path.join(BASE_DIR, "brainforest.db")
 
 # The active knowledge base lives in a contextvar so it propagates correctly
 # between FastAPI's async (event-loop) endpoints and sync (threadpool) endpoints
@@ -86,6 +86,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
     thought_id INTEGER,
     detail TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS thought_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thought_id INTEGER NOT NULL REFERENCES thoughts(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    title_ro TEXT NOT NULL DEFAULT '',
+    content_ro TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_thought_versions_thought ON thought_versions(thought_id, id DESC);
 """
 
 
@@ -307,6 +318,23 @@ def _cosine(a, b):
     return 0.0 if na == 0 or nb == 0 else dot / (na * nb)
 
 
+def get_embedding(thought_id, path=None):
+    """Return the stored embedding vector for a thought (list[float]) or None."""
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT vector, dim FROM thought_embeddings WHERE thought_id = ?",
+            (thought_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _unpack_vec(row["vector"], row["dim"])
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
 def save_embedding(thought_id, model, dim, vector, path=None):
     """Upsert one thought's embedding vector."""
     conn = _connect(path)
@@ -469,6 +497,10 @@ def list_thoughts_in(path: str) -> list[dict]:
 def update_thought(thought_id: int, title=None, content=None, title_ro=None, content_ro=None, source=None):
     conn = _connect()
     try:
+        old = conn.execute(
+            "SELECT title, content, title_ro, content_ro, source FROM thoughts WHERE id = ?",
+            (thought_id,),
+        ).fetchone()
         if title is not None:
             row = conn.execute(
                 "SELECT id FROM thoughts WHERE lower(trim(title)) = lower(trim(?)) "
@@ -495,10 +527,84 @@ def update_thought(thought_id: int, title=None, content=None, title_ro=None, con
             args.append(source)
         if not sets:
             return get_thought(thought_id)
+        now = _now()
+        # Snapshot the pre-edit state whenever any user-visible text field
+        # actually changes, so every content change is recoverable.
+        new_values = {
+            "title": title,
+            "content": content,
+            "title_ro": title_ro,
+            "content_ro": content_ro,
+        }
+        if old is not None and any(
+            new_values[k] is not None and new_values[k] != old[k] for k in new_values
+        ):
+            conn.execute(
+                "INSERT INTO thought_versions (thought_id, title, content, title_ro, content_ro, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (thought_id, old["title"], old["content"], old["title_ro"], old["content_ro"], old["source"], now),
+            )
         sets.append("updated_at = ?")
-        args.append(_now())
+        args.append(now)
         args.append(thought_id)
         conn.execute(f"UPDATE thoughts SET {', '.join(sets)} WHERE id = ?", args)
+        conn.commit()
+        return get_thought(thought_id)
+    finally:
+        conn.close()
+
+
+def list_versions(thought_id: int) -> list[dict]:
+    """Past content states for a thought, newest first. The live row is not a version."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, thought_id, title, content, title_ro, content_ro, source, created_at "
+            "FROM thought_versions WHERE thought_id = ? ORDER BY id DESC",
+            (thought_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_version(version_id: int):
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, thought_id, title, content, title_ro, content_ro, source, created_at "
+            "FROM thought_versions WHERE id = ?",
+            (version_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def restore_version(thought_id: int, version_id: int):
+    """Write a past version's fields back onto the thought, snapshotting the
+    current state first so the restore itself is reversible."""
+    version = get_version(version_id)
+    if version is None or version["thought_id"] != thought_id:
+        raise ValueError("Version not found for this thought")
+    conn = _connect()
+    now = _now()
+    try:
+        cur = conn.execute(
+            "SELECT title, content, title_ro, content_ro, source FROM thoughts WHERE id = ?",
+            (thought_id,),
+        ).fetchone()
+        if cur is None:
+            raise ValueError("Thought not found")
+        conn.execute(
+            "INSERT INTO thought_versions (thought_id, title, content, title_ro, content_ro, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (thought_id, cur["title"], cur["content"], cur["title_ro"], cur["content_ro"], cur["source"], now),
+        )
+        conn.execute(
+            "UPDATE thoughts SET title = ?, content = ?, title_ro = ?, content_ro = ?, source = ?, updated_at = ? WHERE id = ?",
+            (version["title"], version["content"], version["title_ro"], version["content_ro"], version["source"], now, thought_id),
+        )
         conn.commit()
         return get_thought(thought_id)
     finally:
@@ -590,6 +696,74 @@ def list_deleted(limit: int = 200) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def bulk_delete(ids: list[int], cascade: bool = False) -> dict:
+    """Soft-delete several thoughts (and their descendants when cascade)."""
+    deleted, skipped = [], []
+    for tid in ids:
+        try:
+            deleted.extend(delete_thought(tid, cascade=cascade))
+        except Exception as exc:
+            skipped.append({"id": tid, "reason": str(exc)})
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def bulk_move(ids: list[int], target_id: int) -> dict:
+    """Re-parent several thoughts under a single target. Cycle/duplicate edges are skipped."""
+    conn = _connect()
+    moved, skipped = [], []
+    try:
+        for tid in ids:
+            if tid == target_id:
+                skipped.append({"id": tid, "reason": "Cannot link a thought to itself"})
+                continue
+            exists = conn.execute(
+                "SELECT id FROM links WHERE parent_id = ? AND child_id = ?",
+                (target_id, tid),
+            ).fetchone()
+            if exists is not None:
+                skipped.append({"id": tid, "reason": "Already linked"})
+                continue
+            try:
+                _insert_link(conn, target_id, tid)
+                moved.append(tid)
+            except LinkCycleError:
+                skipped.append({"id": tid, "reason": "Would create a cycle"})
+        conn.commit()
+    finally:
+        conn.close()
+    return {"moved": moved, "skipped": skipped}
+
+
+def bulk_export(ids: list[int]) -> dict:
+    """Lossless export payload (version 2 shape) for a subset of active thoughts."""
+    id_set = set(ids)
+    placeholders = ",".join("?" * len(ids))
+    conn = _connect()
+    try:
+        thoughts = [dict(r) for r in conn.execute(
+            "SELECT * FROM thoughts WHERE id IN (" + placeholders + ") AND deleted_at IS NULL",
+            ids,
+        ).fetchall()]
+        links = [dict(r) for r in conn.execute(
+            "SELECT * FROM links WHERE parent_id IN (" + placeholders + ") AND child_id IN (" + placeholders + ")",
+            ids + ids,
+        ).fetchall()]
+        links = [l for l in links if l["parent_id"] in id_set and l["child_id"] in id_set]
+        comments = [dict(r) for r in conn.execute(
+            "SELECT * FROM comments WHERE thought_id IN (" + placeholders + ")",
+            ids,
+        ).fetchall()]
+    finally:
+        conn.close()
+    return {
+        "version": 2,
+        "exported_at": _now(),
+        "thoughts": thoughts,
+        "links": links,
+        "comments": comments,
+    }
 
 
 def _descendant_ids(conn, thought_id):
@@ -862,6 +1036,15 @@ def all_media():
         conn.close()
 
 
+def all_comments():
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT id, thought_id, text, created_at FROM comments ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def delete_media(media_id: int):
     """Delete the media row; return the row (so the caller can remove the file) or None."""
     conn = _connect()
@@ -975,6 +1158,77 @@ def import_kb(graph):
                 conn.execute(
                     "INSERT OR IGNORE INTO links (parent_id, child_id, label, created_at) VALUES (?, ?, ?, ?)",
                     (p, c, e.get("label", ""), _now()),
+                )
+        conn.commit()
+        return get_graph()
+    finally:
+        conn.close()
+
+
+def export_kb_full():
+    """Lossless snapshot: all thoughts (incl. trashed), links, comments, media rows.
+
+    Media file bytes are NOT embedded here — the route enriches rows with
+    base64. Import via import_kb_full restores everything with original
+    timestamps/question_type/deleted_at."""
+    conn = _connect()
+    try:
+        thoughts = [dict(r) for r in conn.execute("SELECT * FROM thoughts ORDER BY id").fetchall()]
+        links = [dict(r) for r in conn.execute("SELECT * FROM links ORDER BY id").fetchall()]
+        comments = [dict(r) for r in conn.execute("SELECT id, thought_id, text, created_at FROM comments ORDER BY id").fetchall()]
+        media = [dict(r) for r in conn.execute("SELECT * FROM media ORDER BY id").fetchall()]
+        return {
+            "version": 2,
+            "exported_at": _now(),
+            "thoughts": thoughts,
+            "links": links,
+            "comments": comments,
+            "media": media,
+        }
+    finally:
+        conn.close()
+
+
+def import_kb_full(graph):
+    """Replace the whole KB, preserving timestamps, question_type, deleted_at,
+    comments, and media rows. Ids are remapped; links/comments/media referencing
+    missing thoughts are skipped. Media file bytes are NOT written here (the
+    route does that)."""
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM thoughts")  # cascades: links, comments, media, embeddings, FTS
+        id_map = {}
+        for n in graph.get("thoughts", []):
+            cur = conn.execute(
+                "INSERT INTO thoughts (title, content, title_ro, content_ro, source, question_type, created_at, updated_at, deleted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (n.get("title", ""), n.get("content", ""), n.get("title_ro", ""), n.get("content_ro", ""),
+                 n.get("source", ""), n.get("question_type", ""), n.get("created_at") or _now(),
+                 n.get("updated_at") or _now(), n.get("deleted_at")),
+            )
+            id_map[n["id"]] = cur.lastrowid
+        for e in graph.get("links", []):
+            p, c = id_map.get(e.get("parent_id")), id_map.get(e.get("child_id"))
+            if p is not None and c is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO links (parent_id, child_id, label, created_at) VALUES (?, ?, ?, ?)",
+                    (p, c, e.get("label", ""), e.get("created_at") or _now()),
+                )
+        for cm in graph.get("comments", []):
+            tid = id_map.get(cm.get("thought_id"))
+            if tid is not None:
+                conn.execute(
+                    "INSERT INTO comments (thought_id, text, created_at) VALUES (?, ?, ?)",
+                    (tid, cm.get("text", ""), cm.get("created_at") or _now()),
+                )
+        for m in graph.get("media", []):
+            tid = id_map.get(m.get("thought_id"))
+            if tid is not None:
+                conn.execute(
+                    "INSERT INTO media (thought_id, filename, stored_path, mime_type, size_bytes, folder, codec, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (tid, m.get("filename", ""), m.get("stored_path", ""), m.get("mime_type", ""),
+                     m.get("size_bytes", 0), m.get("folder", ""), m.get("codec", ""), m.get("created_at") or _now()),
                 )
         conn.commit()
         return get_graph()

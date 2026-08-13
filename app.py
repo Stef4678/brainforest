@@ -1,10 +1,11 @@
-"""Knowledge Brain — FastAPI backend.
+"""Brainforest — FastAPI backend.
 
 Run with:  python app.py
 Then open: http://localhost:8000
 """
 
 import asyncio
+import base64
 import json
 import logging
 import mimetypes
@@ -14,12 +15,13 @@ import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -93,7 +95,7 @@ async def _backup_loop():
         pass
 
 
-app = FastAPI(title="Knowledge Brain", dependencies=[Depends(_set_current_kb)], lifespan=lifespan)
+app = FastAPI(title="Brainforest", dependencies=[Depends(_set_current_kb)], lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -267,6 +269,54 @@ def _media_file_path(media: dict) -> Path:
     if not str(path).startswith(str(root)):
         raise HTTPException(status_code=400, detail="Invalid media path")
     return path
+
+
+MEDIA_EMBED_CAP = 25 * 1024 * 1024  # media over this cap is exported metadata-only
+
+
+def _media_base64(media: dict):
+    """Return (base64|None, warning|None). Caps embed size; tolerant of missing files."""
+    try:
+        path = _media_file_path(media)
+    except HTTPException:
+        return None, f"media row {media.get('id')}: invalid stored path"
+    if not path.is_file():
+        return None, f"media '{media.get('filename')}': file missing on disk"
+    size = path.stat().st_size
+    if size > MEDIA_EMBED_CAP:
+        return None, (
+            f"media '{media.get('filename')}' too large to embed "
+            f"({size / 1048576:.1f} MB > {MEDIA_EMBED_CAP // 1048576} MB cap); imported without bytes"
+        )
+    return base64.b64encode(path.read_bytes()).decode("ascii"), None
+
+
+def _export_media_b64(media_list):
+    out, warnings = [], []
+    for m in media_list:
+        m = dict(m)
+        m["data_base64"], warn = _media_base64(m)
+        if warn:
+            warnings.append(warn)
+        out.append(m)
+    return out, warnings
+
+
+def _write_imported_media(media_list):
+    """Write base64 media bytes back under the current KB's media folder."""
+    root = _media_root().resolve()
+    written = 0
+    for m in media_list:
+        b64 = m.get("data_base64")
+        if not b64:
+            continue
+        dest = (root / m["stored_path"]).resolve()
+        if not str(dest).startswith(str(root)):
+            raise HTTPException(status_code=400, detail="Invalid media path in import")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(base64.b64decode(b64))
+        written += 1
+    return written
 
 
 def _remove_file(path: Path, attempts: int = 5, delay: float = 0.4) -> bool:
@@ -715,6 +765,24 @@ class ThoughtUpdate(BaseModel):
     content_ro: str | None = None
 
 
+class RestoreVersionIn(BaseModel):
+    version_id: int
+
+
+class BulkDeleteIn(BaseModel):
+    ids: list[int]
+    cascade: bool = False
+
+
+class BulkMoveIn(BaseModel):
+    ids: list[int]
+    target_id: int
+
+
+class BulkExportIn(BaseModel):
+    ids: list[int]
+
+
 class LinkIn(BaseModel):
     parent_id: int
     child_id: int
@@ -729,6 +797,13 @@ class SuggestLinkIn(BaseModel):
     title: str
     content: str
     prompt: str | None = None
+    child_id: int | None = None  # exclude this thought from suggestions
+
+
+class SuggestRelationsIn(BaseModel):
+    title: str
+    content: str
+    thought_id: int | None = None  # the focus thought whose children/siblings to suggest
 
 
 class SuggestTitleIn(BaseModel):
@@ -752,6 +827,15 @@ class SemanticSearchIn(BaseModel):
     query: str
     scope: str = "current"
     mode: str = "rerank"  # "rerank" = existing LLM behavior; "vector" = pure local embeddings
+
+
+class DupCheckIn(BaseModel):
+    title: str = ""
+    content: str = ""
+
+
+class FollowupsIn(BaseModel):
+    avoid: list[str] = []  # questions already shown — don't re-suggest these
 
 
 class SettingsIn(BaseModel):
@@ -782,6 +866,22 @@ def thought_detail(thought_id: int):
     if thought is None:
         raise HTTPException(status_code=404, detail="Thought not found")
     return thought
+
+
+@app.get("/api/thoughts/{thought_id}/export")
+def export_thought(thought_id: int, format: str = "md"):
+    thought = db.get_thought(thought_id)
+    if thought is None:
+        raise HTTPException(status_code=404, detail="Thought not found")
+    comments = db.list_comments(thought_id)
+    media, warnings = _export_media_b64(db.list_media(thought_id))
+    if format == "json":
+        payload = {"thought": thought, "comments": comments, "media": media}
+        if warnings:
+            payload["warnings"] = warnings
+        return payload
+    md = build_thought_markdown(thought, comments, media)
+    return Response(content=md, media_type="text/markdown; charset=utf-8")
 
 
 @app.post("/api/thoughts")
@@ -825,6 +925,120 @@ async def create_thought(body: ThoughtIn):
         )
 
 
+def _text_ngrams(text: str, n: int = 3) -> list[str]:
+    s = " ".join(text.lower().split())
+    if len(s) <= n:
+        return [s] if s else []
+    return [s[i : i + n] for i in range(len(s) - n + 1)]
+
+
+def _lexical_similarity(a: str, b: str) -> float:
+    """Cosine similarity over character n-grams — deterministic, language-agnostic."""
+    from collections import Counter
+    ca, cb = Counter(_text_ngrams(a)), Counter(_text_ngrams(b))
+    if not ca or not cb:
+        return 0.0
+    common = sum((ca & cb).values())
+    denom = (sum(ca.values()) * sum(cb.values())) ** 0.5
+    return common / denom if denom else 0.0
+
+
+@app.post("/api/thoughts/check-duplicate")
+async def check_duplicate(body: DupCheckIn):
+    """Best-effort near-duplicate detection before saving a thought.
+
+    Soft feature: a missing API key or any LLM error returns an empty match
+    list rather than an exception, so saving is never blocked by it. Each
+    match carries a `similarity` percent (0-100) between the new thought and
+    the existing one — embedding cosine when available, lexical n-gram cosine
+    otherwise.
+    """
+    query = f"{body.title} {body.content}".strip()[:2000]
+    if len(query) < 30:
+        return {"matches": []}
+    thoughts = _retrieve(query, limit=15)
+    if not thoughts:
+        return {"matches": []}
+    kb_lines = [_kb_line(t) for t in thoughts]
+    messages = [
+        {
+            "role": "system",
+            "content": _lang_instruction() + (
+                "You detect duplicate thoughts in a personal knowledge base. "
+                "Given a NEW thought (title + content) and a list of existing "
+                "thoughts, decide whether any existing thought is essentially "
+                "the same — covering the same ground, so that saving the new "
+                "one would create redundant, overlapping knowledge. Flag only "
+                "genuine same-topic duplicates; do NOT flag merely related, "
+                "adjacent, or broader/narrower topics. When unsure, return an "
+                "empty list. Return JSON exactly of the form "
+                '{"matches": [{"id": <existing id>, "reason": "..."}]} with '
+                "at most 2 matches (most-duplicate first), or {\"matches\": []} "
+                "if none."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"New thought:\nTitle: {body.title}\nContent:\n{body.content or '(none)'}\n\n"
+                "Existing thoughts (subset):\n"
+                + ("\n".join(kb_lines) if kb_lines else "(none)")
+            ),
+        },
+    ]
+    settings = resolve_settings()
+    try:
+        result = await deepseek_client.chat_json(
+            messages,
+            model=settings["model"],
+            temperature=0.2,
+            api_key=settings["api_key"],
+            base_url=settings["base_url"],
+        )
+    except Exception:
+        return {"matches": []}
+    raw = result.get("matches") if isinstance(result, dict) else None
+    if not isinstance(raw, list):
+        return {"matches": []}
+    ids = {t["id"] for t in thoughts}
+    by_id = {t["id"]: t for t in thoughts}
+    matches, seen = [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("id")
+        reason = (item.get("reason") or "").strip()
+        if not isinstance(tid, int) or tid not in ids or tid in seen:
+            continue
+        seen.add(tid)
+        matches.append({
+            "id": tid,
+            "title": by_id[tid]["title"],
+            "title_ro": by_id[tid].get("title_ro", ""),
+            "content": by_id[tid].get("content", ""),
+            "content_ro": by_id[tid].get("content_ro", ""),
+            "reason": reason,
+        })
+        if len(matches) >= 2:
+            break
+
+    new_text = _embed_text({"title": body.title or "", "title_ro": "", "content": body.content or "", "content_ro": ""})
+    query_vec = None
+    if _setting_bool(settings.get("embedding_enabled", "false")):
+        query_vec = await asyncio.to_thread(embeddings.embed_one, new_text, model=settings.get("embedding_model"))
+    for m in matches:
+        existing_text = _embed_text(by_id[m["id"]])
+        sim = None
+        if query_vec is not None:
+            stored = db.get_embedding(m["id"])
+            if stored and len(stored) == len(query_vec):
+                sim = db._cosine(query_vec, stored)
+        if sim is None:
+            sim = _lexical_similarity(new_text, existing_text)
+        m["similarity"] = int(round(max(0.0, min(1.0, sim)) * 100))
+    return {"matches": matches}
+
+
 @app.put("/api/thoughts/{thought_id}")
 def update_thought(thought_id: int, body: ThoughtUpdate):
     thought = db.get_thought(thought_id)
@@ -857,6 +1071,56 @@ def update_thought(thought_id: int, body: ThoughtUpdate):
     if updated:
         _index_thought(updated)
     return updated
+
+
+@app.get("/api/thoughts/{thought_id}/versions")
+def list_versions(thought_id: int):
+    thought = db.get_thought(thought_id)
+    if thought is None:
+        raise HTTPException(status_code=404, detail="Thought not found")
+    return {"versions": db.list_versions(thought_id)}
+
+
+@app.post("/api/thoughts/{thought_id}/restore-version")
+def restore_version(thought_id: int, body: RestoreVersionIn):
+    thought = db.get_thought(thought_id)
+    if thought is None:
+        raise HTTPException(status_code=404, detail="Thought not found")
+    try:
+        updated = db.restore_version(thought_id, body.version_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if updated:
+        _index_thought(updated)
+    db.log_event("restore_version", thought_id, detail=f"version_id={body.version_id}")
+    return updated
+
+
+@app.post("/api/thoughts/bulk-delete")
+def bulk_delete(body: BulkDeleteIn):
+    if not body.ids:
+        raise HTTPException(status_code=400, detail="No thoughts selected")
+    result = db.bulk_delete(body.ids, cascade=body.cascade)
+    for tid in result["deleted"]:
+        db.log_event("bulk_delete", tid, detail=f"cascade={body.cascade}")
+    return result
+
+
+@app.post("/api/thoughts/bulk-move")
+def bulk_move(body: BulkMoveIn):
+    if not body.ids:
+        raise HTTPException(status_code=400, detail="No thoughts selected")
+    result = db.bulk_move(body.ids, body.target_id)
+    for tid in result["moved"]:
+        db.log_event("bulk_move", tid, detail=f"parent_id={body.target_id}")
+    return result
+
+
+@app.post("/api/thoughts/bulk-export")
+def bulk_export(body: BulkExportIn):
+    if not body.ids:
+        raise HTTPException(status_code=400, detail="No thoughts selected")
+    return db.bulk_export(body.ids)
 
 
 @app.delete("/api/thoughts/{thought_id}")
@@ -1069,23 +1333,69 @@ async def chat(body: ChatIn):
     )
 
 
+RANK_SET = {"kingdom", "phylum", "class", "order", "family", "genus", "species"}
+
+
+def _clean_new_concepts(raw, skip_lower=""):
+    """Sanitize the model's proposed new concepts (parents/children/siblings)."""
+    out, seen = [], set()
+    if not isinstance(raw, list):
+        return out
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        title = (it.get("title") or "").strip()
+        if not title:
+            continue
+        key = title.lower()
+        if skip_lower and key == skip_lower:
+            continue  # the focus/new thought itself
+        if key in seen:
+            continue
+        seen.add(key)
+        rank = (it.get("rank") or "").strip().lower()
+        english = it.get("english")
+        english = (english.strip() if isinstance(english, str) else "") or None
+        out.append({
+            "title": title,
+            "rank": rank if rank in RANK_SET else "",
+            "english": english,
+            "content": (it.get("content") or "").strip(),
+            "reason": (it.get("reason") or "").strip(),
+        })
+    return out[:8]
+
+
 @app.post("/api/chat/suggest-link")
 async def suggest_link(body: SuggestLinkIn):
     content = body.content.strip()
-    if not content:
+    if not content and not body.title.strip():
         raise HTTPException(status_code=400, detail="No content to place in the knowledge base")
 
     thoughts = _retrieve(body.title + " " + content, limit=25)
+    if body.child_id is not None:
+        thoughts = [t for t in thoughts if t["id"] != body.child_id]
+    if not thoughts:
+        # BM25 matched only the new thought itself — widen to the rest of the
+        # KB so the model has real candidates to link under instead of a null root.
+        thoughts = [t for t in db.list_thoughts() if t["id"] != body.child_id][:25]
     kb_lines = [_kb_line(t) for t in thoughts]
 
     user_parts = [
-        f"The new thought is:\nTitle: {body.title}\nContent:\n{content}",
+        f"The new thought is:\nTitle: {body.title}\nContent:\n{content or '(none)'}",
     ]
     if body.prompt:
         user_parts.append(f"It came from this chat prompt: {body.prompt}")
     user_parts.append(
-        "Choose the best existing thought to be its parent, or null for a new root "
-        "thought if nothing fits or the best fit is not listed."
+        "Use science as the organizing guide: treat the knowledge base like a "
+        "taxonomy (kingdom → phylum → class → order → family → genus → species), "
+        "where a more specific thought links under a broader one. Choose up to 3 "
+        "existing thoughts this new thought could link under as parents, ranked "
+        "best first, always preferring the most specific applicable existing "
+        "ancestor — never settle for a broad umbrella (like the root) when a "
+        "closer concept also fits. Prefer multiple distinct specific parents when "
+        "they exist. If nothing existing fits closely enough, propose new_parents "
+        "instead of null."
     )
     user_parts.append("Most relevant existing thoughts (subset):\n" + ("\n".join(kb_lines) if kb_lines else "(none)"))
 
@@ -1093,15 +1403,38 @@ async def suggest_link(body: SuggestLinkIn):
         {
             "role": "system",
             "content": _lang_instruction() + (
-                "You are organizing a personal knowledge base where thoughts form a "
-                "tree: each thought has a parent (or is a root). Given a new thought "
-                "and a list of the most relevant existing thoughts, decide where it "
-                "best belongs. Return "
-                "JSON exactly of the form: "
-                '{"parent_id": <an existing thought id or null>, "reason": "..."} '
-                "The reason is one or two sentences explaining the choice. If no "
-                "existing thought is a good fit, return parent_id null to make it a "
-                "new root thought."
+                "You are organizing a personal knowledge base of scientific concepts "
+                "arranged like a taxonomic hierarchy — a more specific thought links "
+                "under a broader one (kingdom → phylum → class → order → family → "
+                "genus → species). Given a new thought and the most relevant existing "
+                "thoughts, choose up to 3 existing thoughts it could be linked under "
+                "as parents, ranked best first, always preferring the most specific "
+                "existing ancestor — never pick a broad umbrella (like the root of "
+                "the graph) when a closer concept also fits (for 'cats', prefer "
+                "'Biodiversity and Global Life Forms' over 'Life'), and suggest "
+                "multiple distinct specific parents when they exist. If several "
+                "chosen parents already form an ancestor chain, keep only the most "
+                "specific one and mention the broader ones in the reason. When a "
+                "chosen parent's title is a Latin taxonomic rank, also provide its "
+                "English/common name. Return JSON "
+                'exactly of the form: '
+                '{"suggestions": [{"parent_id": <an existing thought id or null>, '
+                '"reason": "...", "english": "<english/common name or null>"}], '
+                '"new_parents": [{"title": "...", "rank": "...", "english": "...", '
+                '"content": "...", "reason": "..."}]} '
+                "Each reason is one or two sentences. If an existing thought already "
+                "fits, prefer returning it in suggestions. If no existing thought is a "
+                "good parent, or the only fitting existing thoughts are too broad "
+                "(a general umbrella or the root), do not just return null or settle "
+                "for the umbrella: propose 1 or more NEW parent "
+                "concepts the thought belongs under, using the taxonomic ranks as a "
+                "guide (for cats, for example: family \"Felidae\", order \"Carnivora\", "
+                "class \"Mammalia\"). Put them in new_parents, ordered from broadest "
+                "to most specific, each with a rank from kingdom, phylum, class, order, "
+                "family, genus, species, the English/common name when the title is "
+                "Latin, a short one-sentence content, and a one-sentence reason. Only "
+                "use a null suggestion when no existing thought fits and you have no "
+                "new-parent proposal either."
             ),
         },
         {"role": "user", "content": "\n\n".join(user_parts)},
@@ -1121,21 +1454,209 @@ async def suggest_link(body: SuggestLinkIn):
     except deepseek_client.DeepSeekError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    reason = (result.get("reason") if isinstance(result, dict) else None) or ""
+    raw = result.get("suggestions") if isinstance(result, dict) else None
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=502, detail="DeepSeek did not return a list of suggestions")
     existing_ids = {t["id"] for t in thoughts}
-    raw_parent = result.get("parent_id") if isinstance(result, dict) else None
-    parent_id = raw_parent if isinstance(raw_parent, int) and raw_parent in existing_ids else None
+    titles = {t["id"]: t["title"] for t in thoughts}
 
-    parent_title = None
-    if parent_id is not None:
-        parent = db.get_thought(parent_id)
-        parent_title = parent["title"] if parent else None
+    items = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        pid = it.get("parent_id")
+        reason = (it.get("reason") or "").strip()
+        english = it.get("english")
+        english = (english.strip() if isinstance(english, str) else "") or None
+        if not isinstance(pid, int) or pid not in existing_ids:
+            continue
+        items.append({"parent_id": pid, "reason": reason, "english": english})
 
-    return {
-        "parent_id": parent_id,
-        "parent_title": parent_title,
-        "reason": reason,
+    # Dedupe, keep order.
+    seen, deduped = set(), []
+    for it in items:
+        if it["parent_id"] not in seen:
+            seen.add(it["parent_id"])
+            deduped.append(it)
+
+    if raw and isinstance(raw[0], dict) and raw[0].get("parent_id") is None:
+        # Top choice is "new root" — return a single null suggestion so the
+        # chat save flow's root-vs-parent semantics stay intact.
+        suggestions = [{"parent_id": None, "parent_title": None, "reason": (raw[0].get("reason") or "").strip(), "english": None}]
+    else:
+        suggestions = [
+            {
+                "parent_id": it["parent_id"],
+                "parent_title": titles.get(it["parent_id"]),
+                "reason": it["reason"],
+                "english": it["english"],
+            }
+            for it in deduped[:3]
+        ]
+
+    # New-parent proposals (taxonomic chain) used when no existing thought fits.
+    new_parents = _clean_new_concepts(
+        result.get("new_parents") if isinstance(result, dict) else None,
+        body.title.strip().lower(),
+    )
+
+    return {"suggestions": suggestions, "new_parents": new_parents}
+
+
+@app.post("/api/chat/suggest-relations")
+async def suggest_relations(body: SuggestRelationsIn):
+    content = body.content.strip()
+    if not content and not body.title.strip():
+        raise HTTPException(status_code=400, detail="No content to place in the knowledge base")
+
+    focus = db.get_thought(body.thought_id) if body.thought_id is not None else None
+    if focus is None:
+        raise HTTPException(status_code=404, detail="Thought not found")
+
+    focus_id = focus["id"]
+    children = focus.get("children") or []
+    child_ids = {c["id"] for c in children}
+    parents = focus.get("parents") or []
+    parent_ids = {p["id"] for p in parents}
+    all_thoughts = db.list_thoughts()
+    # Existing siblings = thoughts sharing any direct parent with the focus.
+    sibling_ids = {
+        t["id"]
+        for t in all_thoughts
+        if t["id"] != focus_id
+        and any(p["id"] in parent_ids for p in (t.get("parents") or []))
     }
+
+    others = _retrieve(body.title + " " + content, limit=25)
+    others = [t for t in others if t["id"] != focus_id and t["id"] not in child_ids]
+    if not others:
+        others = [t for t in all_thoughts if t["id"] != focus_id and t["id"] not in child_ids][:25]
+    others_ids = {t["id"] for t in others}
+    titles = {t["id"]: t["title"] for t in all_thoughts}
+
+    parents_lines = [_kb_line(p) for p in parents]
+    children_lines = [_kb_line(c) for c in children]
+    siblings_lines = [_kb_line(t) for t in all_thoughts if t["id"] in sibling_ids]
+    others_lines = [_kb_line(t) for t in others]
+
+    messages = [
+        {
+            "role": "system",
+            "content": _lang_instruction() + (
+                "You are organizing a personal knowledge base of scientific concepts "
+                "arranged like a taxonomic hierarchy — a more specific thought links "
+                "under a broader one (kingdom → phylum → class → order → family → "
+                "genus → species). Given one focus thought, its current parents, its "
+                "current children, its current siblings, and the most relevant other "
+                "thoughts, suggest two things. (1) CHILDREN: other thoughts that fit "
+                "well as children of the focus thought (more specific concepts that "
+                "belong directly under it), plus NEW child concepts worth creating — "
+                "do not repeat the current children. (2) SIBLINGS: existing and "
+                "NEW thoughts that belong under the SAME direct parent as the focus "
+                "thought, at the same rank and specificity — a sibling shares the "
+                "focus thought's parent, not a grandparent (for the species 'cats' "
+                "under Felidae, siblings are other Felidae members like lions or "
+                "tigers, NOT other families under Carnivora). Do not repeat the "
+                "current siblings. Always prefer the "
+                "most specific existing thought that fits; never pick a broad "
+                "umbrella when a closer concept fits. When a suggested title is a "
+                "Latin taxonomic rank, also provide its English/common name. Return "
+                'JSON exactly of the form: '
+                '{"children": [{"child_id": <an existing thought id or null>, '
+                '"reason": "...", "english": "<english/common name or null>"}], '
+                '"new_children": [{"title": "...", "rank": "...", "english": "...", '
+                '"content": "...", "reason": "..."}], '
+                '"siblings": [{"sibling_id": <an existing thought id or null>, '
+                '"reason": "...", "english": "<english/common name or null>"}], '
+                '"new_siblings": [{"title": "...", "rank": "...", "english": "...", '
+                '"content": "...", "reason": "..."}]} '
+                "Each reason is one or two sentences. Only reference ids that appear "
+                "in the provided lists. If nothing fits for a group, return an empty "
+                "list for that group."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Focus thought (id {focus_id}):\n"
+                f"Title: {_display_title(focus)}\nContent:\n{_kb_text(focus)}"
+                "\n\nCurrent parents:\n" + ("\n".join(parents_lines) if parents_lines else "(none)")
+                + "\n\nCurrent children:\n" + ("\n".join(children_lines) if children_lines else "(none)")
+                + "\n\nCurrent siblings:\n" + ("\n".join(siblings_lines) if siblings_lines else "(none)")
+                + "\n\nOther thoughts (subset):\n" + ("\n".join(others_lines) if others_lines else "(none)")
+            ),
+        },
+    ]
+
+    settings = resolve_settings()
+    try:
+        result = await deepseek_client.chat_json(
+            messages,
+            model=settings["model"],
+            temperature=0.4,
+            api_key=settings["api_key"],
+            base_url=settings["base_url"],
+        )
+    except deepseek_client.ApiKeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except deepseek_client.DeepSeekError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    result = result if isinstance(result, dict) else {}
+
+    def _clean_existing(items, id_key):
+        out, seen = [], set()
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            sid = it.get(id_key)
+            reason = (it.get("reason") or "").strip()
+            english = it.get("english")
+            english = (english.strip() if isinstance(english, str) else "") or None
+            if not isinstance(sid, int) or sid not in others_ids or sid == focus_id:
+                continue
+            if sid in seen:
+                continue
+            seen.add(sid)
+            out.append({"id": sid, "title": titles.get(sid), "reason": reason, "english": english})
+        return out
+
+    children = []
+    for it in _clean_existing(result.get("children"), "child_id"):
+        if it["id"] in child_ids:
+            continue  # already a child
+        ok, _ = db.validate_link(focus_id, it["id"])
+        if not ok:
+            continue
+        children.append({
+            "child_id": it["id"],
+            "child_title": it["title"],
+            "reason": it["reason"],
+            "english": it["english"],
+        })
+    children = children[:3]
+
+    siblings = []
+    for it in _clean_existing(result.get("siblings"), "sibling_id"):
+        if it["id"] in sibling_ids:
+            continue  # already shares a parent
+        ok = any(
+            db.validate_link(pid, it["id"])[0] for pid in parent_ids
+        ) if parent_ids else True
+        if not ok:
+            continue
+        siblings.append({
+            "sibling_id": it["id"],
+            "sibling_title": it["title"],
+            "reason": it["reason"],
+            "english": it["english"],
+        })
+    siblings = siblings[:3]
+
+    new_children = _clean_new_concepts(result.get("new_children"), body.title.strip().lower())
+    new_siblings = _clean_new_concepts(result.get("new_siblings"), body.title.strip().lower())
+
+    return {"children": children, "new_children": new_children, "siblings": siblings, "new_siblings": new_siblings}
 
 
 async def _suggest_titles(title: str, content: str) -> dict:
@@ -1725,10 +2246,19 @@ async def translate_content():
 
 
 @app.post("/api/thoughts/{thought_id}/followups")
-async def followups(thought_id: int):
+async def followups(thought_id: int, body: FollowupsIn | None = None):
     thought = db.get_thought(thought_id)
     if thought is None:
         raise HTTPException(status_code=404, detail="Thought not found")
+
+    avoid = [q.strip() for q in (body.avoid if body else []) if q.strip()]
+
+    # Related existing thoughts, so the model can tag questions whose answers
+    # already exist in the KB (avoids re-suggesting already-saved questions).
+    existing = [t for t in _retrieve(_kb_text(thought), limit=12) if t["id"] != thought_id]
+    existing_ids = {t["id"] for t in existing}
+    existing_titles = {t["id"]: t["title"] for t in existing}
+    existing_lines = "\n".join(_kb_line(t) for t in existing) if existing else "(none)"
 
     messages = [
         {
@@ -1736,23 +2266,33 @@ async def followups(thought_id: int):
             "content": _lang_instruction() + (
                 "Given a thought in a personal knowledge base, suggest follow-up "
                 "questions the user could ask in a chat about this thought. Return "
-                "SIX groups, each with exactly 2 short questions, as JSON of the "
-                "form: {\"scientific\": [\"...\", \"...\"], \"practical\": [\"...\", "
-                "\"...\"], \"comparative\": [\"...\", \"...\"], \"historical\": "
-                "[\"...\", \"...\"], \"causal\": [\"...\", \"...\"], \"critical\": "
-                "[\"...\", \"...\"]}. Group styles: scientific explores the topic "
-                "deeper and conceptually; practical is simple, everyday and "
-                "actionable (concrete real-life application); comparative compares "
-                "this thought with related or opposite concepts; historical asks "
-                "how this idea evolved and what influenced it over time; causal "
-                "asks what causes this and what its consequences are; critical "
-                "raises the strongest objections, counterarguments, or weaknesses."
+                "ALL SIX groups with EXACTLY 2 short questions EACH (12 questions "
+                "total) — never fewer, never empty, even if you must work harder "
+                "to find a different angle. JSON form: "
+                '{"scientific": [{"q": "...", "covered_id": <id or null>}, ...], ...}. '
+                "Group styles: scientific explores the topic deeper and conceptually; "
+                "practical is simple, everyday and actionable (concrete real-life "
+                "application); comparative compares this thought with related or "
+                "opposite concepts; historical asks how this idea evolved and what "
+                "influenced it over time; causal asks what causes this and what its "
+                "consequences are; critical raises the strongest objections, "
+                "counterarguments, or weaknesses. For EACH question, look at the "
+                "EXISTING thoughts listed. If an existing thought already answers "
+                "that question — saving the answer would be redundant — set "
+                "covered_id to that existing thought's id; otherwise null. Only mark "
+                "genuinely same-topic questions; do NOT mark related, adjacent, or "
+                "broader/narrower topics. If the avoid list is given, you MUST NOT "
+                "repeat those questions in any form; replace each with a different "
+                "one and keep all six groups full."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Title: {_display_title(thought)}\n\nContent:\n{_kb_text(thought)}"
+                (f"Do NOT re-suggest these questions (the user has seen them):\n{', '.join(avoid)}\n\n"
+                 if avoid else "")
+                + f"Thought the user is reading:\nTitle: {_display_title(thought)}\n\nContent:\n{_kb_text(thought)}\n\n"
+                f"Existing thoughts in this knowledge base (subset, by id):\n{existing_lines}"
             ),
         },
     ]
@@ -1779,7 +2319,26 @@ async def followups(thought_id: int):
         raw = result.get(key)
         if not isinstance(raw, list):
             return []
-        return [str(q).strip() for q in raw if str(q).strip()][:2]
+        out, seen = [], set()
+        for item in raw:
+            if isinstance(item, dict):
+                q = str(item.get("q") or "").strip()
+                cid = item.get("covered_id")
+            else:
+                q = str(item).strip()
+                cid = None
+            if not q or q.lower() in seen:
+                continue
+            seen.add(q.lower())
+            if any(q.lower() == a.lower() for a in avoid):
+                continue
+            if isinstance(cid, int) and cid in existing_ids:
+                out.append({"q": q, "covered_id": cid, "covered_title": existing_titles[cid]})
+            else:
+                out.append({"q": q, "covered_id": None, "covered_title": ""})
+            if len(out) >= 2:
+                break
+        return out
 
     out = {key: clean_group(key) for key in GROUPS}
     if not any(out.values()):
@@ -2163,18 +2722,96 @@ async def search_semantic(body: SemanticSearchIn):
 
 # ------------------------------------------------------------------ export
 
+
+def _md_lines(rows) -> str:
+    return "\n".join(f"- {r}" for r in rows) if rows else "_none_"
+
+
+def build_kb_markdown(graph) -> str:
+    nodes, edges = graph["nodes"], graph["edges"]
+    titles = {n["id"]: n["title"] for n in nodes}
+    link_map = "\n".join(
+        f"- {titles.get(e['parent_id'], e['parent_id'])} (#{e['parent_id']}) → "
+        f"{titles.get(e['child_id'], e['child_id'])} (#{e['child_id']})"
+        for e in edges
+    ) or "_none_"
+    parts = [
+        f"# {kb_registry.get_current()} — exported {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}",
+        f"{len(nodes)} thoughts, {len(edges)} links.\n\n## Link map\n{link_map}",
+    ]
+    for n in nodes:
+        parts.append(
+            f"## {n['title']} — #{n['id']}\n"
+            f"- Source: {n.get('source') or '—'} | Question type: {n.get('question_type') or '—'}\n"
+            f"- Created: {n.get('created_at')} | Updated: {n.get('updated_at')}\n\n"
+            f"### Content\n{n.get('content') or ''}"
+        )
+        if n.get("content_ro"):
+            parts.append(f"\n### Content (Română)\n{n['content_ro']}")
+    return "\n\n---\n\n".join(parts) + "\n"
+
+
+def build_thought_markdown(thought, comments, media) -> str:
+    t = thought
+    parents = [f"{p['title']} (#{p['id']})" for p in t.get("parents", [])]
+    children = [f"{c['title']} (#{c['id']})" for c in t.get("children", [])]
+    siblings = [f"{s['title']} (#{s['id']})" for s in t.get("siblings", [])]
+    comment_lines = [f"- {c['created_at']}: {c['text']}" for c in comments]
+    media_lines = [f"- {m['filename']} ({m['mime_type']}, {m['size_bytes']} B)" for m in media]
+    parts = [
+        "---\n"
+        f"id: {t['id']}\n"
+        f"title: {t['title']}\n"
+        f"source: {t.get('source') or ''}\n"
+        f"question_type: {t.get('question_type') or ''}\n"
+        f"created_at: {t.get('created_at')}\n"
+        f"updated_at: {t.get('updated_at')}\n"
+        "---\n\n"
+        f"# {t['title']}",
+        f"## Content\n{t.get('content') or ''}",
+    ]
+    if t.get("content_ro"):
+        parts.append(f"## Content (Română)\n{t['content_ro']}")
+    parts += [
+        f"## Parents\n{_md_lines(parents)}",
+        f"## Children\n{_md_lines(children)}",
+        f"## Siblings\n{_md_lines(siblings)}",
+        f"## Comments\n{_md_lines(comment_lines)}",
+        f"## Media\n{_md_lines(media_lines)}",
+    ]
+    return "\n\n".join(parts) + "\n"
+
+
 @app.get("/api/export")
-def export_kb():
-    return db.export_kb()
+def export_kb(format: str = "json"):
+    if format == "md":
+        md = build_kb_markdown(db.get_graph())
+        return Response(content=md, media_type="text/markdown; charset=utf-8")
+    data = db.export_kb_full()
+    data["media"], warnings = _export_media_b64(data["media"])
+    if warnings:
+        data["warnings"] = warnings
+    return data
 
 
 @app.post("/api/import")
 def import_kb(graph_data: dict):
+    if "thoughts" in graph_data:
+        # Lossless shape: preserve timestamps, question_type, deleted_at,
+        # comments, and media (bytes written back from base64).
+        old_media = db.all_media()
+        result = db.import_kb_full(graph_data)
+        for m in old_media:
+            _remove_file(_media_file_path(m))
+        _write_imported_media(graph_data.get("media", []))
+        _cleanup_orphan_media()
+        _request_rebuild("current", resolve_settings().get("embedding_model"))
+        return result
     if "nodes" not in graph_data or "edges" not in graph_data:
         raise HTTPException(
-            status_code=400, detail="Expected JSON with 'nodes' and 'edges' arrays"
+            status_code=400, detail="Expected JSON with 'thoughts' (or 'nodes'/'edges') arrays"
         )
-    # Import replaces the whole KB: drop the previous media rows' files too.
+    # Legacy {nodes, edges} shape, unchanged.
     media_rows = db.all_media()
     result = db.import_kb(graph_data)
     for m in media_rows:
@@ -2206,7 +2843,7 @@ def main():
     import uvicorn
 
     port = int(os.environ.get("PORT", "8000"))
-    print(f"Knowledge Brain running at http://localhost:{port}")
+    print(f"Brainforest running at http://localhost:{port}")
     uvicorn.run(app, host="127.0.0.1", port=port)
 
 

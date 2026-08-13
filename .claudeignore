@@ -1,0 +1,11 @@
+# Virtualenv / build artifacts
+.venv/
+__pycache__/
+
+# Databases (per-KB SQLite files and the legacy root DB)
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets — never load into context
+.env

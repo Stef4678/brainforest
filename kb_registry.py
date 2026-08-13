@@ -15,7 +15,7 @@ KB_DIR = os.path.join(BASE_DIR, "knowledge_bases")
 REGISTRY_PATH = os.path.join(BASE_DIR, "knowledge_bases.json")
 
 DEFAULT_KB_NAME = "My Knowledge Base"
-LEGACY_DB = os.path.join(BASE_DIR, "knowledge_brain.db")
+LEGACY_DB = os.path.join(BASE_DIR, "brainforest.db")
 
 
 def _read():
@@ -84,7 +84,7 @@ def ensure_registry():
         _write({"current": current, "bases": bases})
         return
 
-    # Genuine first run: migrate the legacy single knowledge_brain.db into a
+    # Genuine first run: migrate the legacy single brainforest.db into a
     # named KB.
     if os.path.exists(LEGACY_DB):
         filename = _slug(DEFAULT_KB_NAME) + ".db"
